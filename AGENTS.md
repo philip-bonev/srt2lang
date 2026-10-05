@@ -191,19 +191,56 @@ is called, all covered by unit tests:
   to `"<digits>"`. A bare `"` is never legal inside a JSON string (it must be
   `\"`), so the pattern cannot occur in valid JSON and the repair is safe.
 - **An illegal escape sequence** — `мнения\за`, a backslash before Cyrillic
-  text where a newline was meant. `repair_invalid_escapes` doubles any
-  backslash not followed by `" \ / b f n r t` or four hex digits after `u`.
-  One bad escape costs every cue in the batch, and it is what left a cue
+  text where a newline was meant. `repair_invalid_escapes` rewrites any
+  backslash not followed by `" \ / b f n r t` or four hex digits after `u`
+  **as a newline escape** (`\n`), not as a literal backslash: the system
+  prompt tells the model that multi-line cue values are joined by `\n`, so
+  that is the separator written wrong. Emitting `\` instead would parse but
+  leave a visible `\` on screen and still count as line drift. One bad
+  escape costs every cue in the batch, and it is what left a cue
   untranslated through three batch attempts *and* its single-cue retry.
 
 All four run through `repair_json`, the single entry point called before
 `serde_json`. New repairs belong there — each pass must leave already-valid
 text untouched, since a repair that corrupts good JSON turns a clean error
-into a silently wrong result.
+into a deliberately wrong result.
+
+A fifth failure is handled *outside* `repair_json`, because it stops the
+braces from balancing in the first place:
+
+- **Curly quotes as string delimiters** — the model closes a value with `”`
+  or `“` instead of `"`, leaving the string unterminated. The closing `}`
+  then reads as string content, `json_object_candidates` finds no balanced
+  object, and the parser is never reached (observed killing a batch on three
+  consecutive attempts). `parse_translations` therefore runs a **second pass
+  over the whole reply** when the first found fewer cues than expected:
+  `straighten_curly_quotes` converts `“ ”` to `"` and extraction is re-run,
+  with first-pass entries winning on conflict. It is guarded on the first
+  pass falling short precisely because Bulgarian text legitimately uses
+  `“ ”` as quotation marks — rewriting a healthy reply would terminate
+  strings early and corrupt the values.
 
 Failed batches retry `config.retries` times before falling back. Progress and
 warnings go to stderr and name the cue number, so a run's decisions are
 auditable.
+
+#### Known-but-unrepaired: a backslash before the closing quote
+
+The model occasionally *escapes the terminator it meant to end on*:
+
+```
+"3": "- Анжели?\",
+"4": "Прочети го."
+```
+
+`\"` is a **legal** escape, so no repair can recognise it by syntax alone: it
+is exactly what a value legitimately containing a quote looks like
+(`"He said \"hi\","`). Every rule that would rewrite it can therefore rewrite
+a correct value, and because the rewrite closes the string early the result
+can still parse — with a key or value silently mangled, which passes both the
+line-count and Cyrillic checks. That is the "silently wrong" outcome the
+repairs exist to avoid, so this one is deliberately **not** repaired: the
+`retrying batch (attempt 2)` path recovers it, observed costing one retry.
 
 ## Configuration
 

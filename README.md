@@ -167,9 +167,11 @@ retried individually. The individual retry is accepted even if imperfect,
 because a translation with a warning beats English text. Anything still
 untranslated is kept as-is and reported.
 
-**Malformed JSON repairs.** Four known small-model failure patterns are
-repaired before parsing: raw newlines in strings, naive brace extraction,
-doubled key quotes, and illegal escape sequences.
+**Malformed JSON repairs.** Five known small-model failure patterns are
+repaired before or during parsing: raw newlines in strings, naive brace
+extraction, doubled key quotes, illegal escape sequences (rewritten as line
+breaks), and curly quotes used to close a string. Each repair is guarded so
+it only ever runs on a reply that already failed to parse.
 
 ## Quality report
 

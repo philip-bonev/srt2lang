@@ -440,15 +440,44 @@ fn post_chat(cfg: &Config, payload: &Value) -> Result<String, String> {
 ///
 /// Candidate objects are found by balanced-brace scanning rather than
 /// "first `{` to last `}`": a model that emits two objects, or a `}` inside
-/// trailing prose, would otherwise produce an unparseable slice. The
-/// candidate yielding the most usable cues wins.
+/// trailing prose, would otherwise produce an unparseable slice. Findings
+/// from every candidate are merged, since a reply may legitimately split
+/// across objects.
+///
+/// Two passes. The second straightens curly quotes used as string
+/// delimiters and runs only when the first pass came up short, because that
+/// rewrite also touches Bulgarian quotation marks and must never see a
+/// healthy reply. Entries from the first pass win on conflict.
 fn parse_translations(content: &str, expected: usize) -> Result<BTreeMap<usize, String>, String> {
     let stripped = strip_fences(content);
+    let mut found = collect_json_objects(stripped, expected);
+
+    if found.len() < expected {
+        // A curly quote left a string unterminated, so the closing `}` reads
+        // as part of that string and the object never balances — extraction
+        // finds nothing and the parser is never reached. Straightening the
+        // whole reply first is the only way to get a candidate out of it.
+        let straightened = straighten_curly_quotes(stripped);
+        for (pos, text) in collect_json_objects(&straightened, expected) {
+            found.entry(pos).or_insert(text);
+        }
+    }
+
+    if found.is_empty() {
+        return Err(format!(
+            "no usable translations in reply: {}",
+            truncate(content, 200)
+        ));
+    }
+    Ok(found)
+}
+
+/// Parse every balanced object in `text` and harvest the usable cues.
+fn collect_json_objects(text: &str, expected: usize) -> BTreeMap<usize, String> {
     let mut found: BTreeMap<usize, String> = BTreeMap::new();
 
-    for candidate in json_object_candidates(stripped) {
-        let repaired = repair_json(candidate);
-        let Ok(parsed) = serde_json::from_str::<Value>(&repaired) else {
+    for candidate in json_object_candidates(text) {
+        let Ok(parsed) = serde_json::from_str::<Value>(&repair_json(candidate)) else {
             continue;
         };
         let Some(obj) = parsed.as_object() else {
@@ -468,14 +497,7 @@ fn parse_translations(content: &str, expected: usize) -> Result<BTreeMap<usize, 
             break; // every cue accounted for
         }
     }
-
-    if found.is_empty() {
-        return Err(format!(
-            "no usable translations in reply: {}",
-            truncate(content, 200)
-        ));
-    }
-    Ok(found)
+    found
 }
 
 /// Balanced `{...}` objects found in `text`.
@@ -544,18 +566,33 @@ fn repair_json(json: &str) -> String {
     repair_invalid_escapes(&repair_doubled_key_quotes(&escape_control_chars_in_strings(json)))
 }
 
-/// Double any backslash inside a string that does not introduce a legal
-/// escape, turning it into a literal backslash.
+/// Replace curly double quotes with straight ones.
 ///
-/// Models emit these when they mangle a line break: `мнения\за` where a `\n`
-/// was intended. serde_json rejects the whole reply over it, so one bad
-/// escape costs every cue in the batch — that is how a single cue ended up
-/// untranslated after four separate attempts.
+/// Used only as a second pass over an already-failing reply: Bulgarian text
+/// legitimately uses `“ ”` as quotation marks, so rewriting them on a healthy
+/// reply would terminate strings early and corrupt the values.
+fn straighten_curly_quotes(text: &str) -> String {
+    text.replace(['\u{201C}', '\u{201D}'], "\"")
+}
+
+/// Rewrite any backslash inside a string that does not introduce a legal
+/// escape as a newline escape (`\n`).
+///
+/// The system prompt tells the model that multi-line cue values are joined by
+/// `\n`, so an illegal escape is that separator written wrong — observed as
+/// `мнения\за`, a backslash before Cyrillic text where a newline belonged.
+/// serde_json rejects the whole reply over it, and one bad escape costs every
+/// cue in the batch: that is how a single cue went untranslated through three
+/// batch attempts *and* its single-cue retry.
+///
+/// Emitting a literal backslash instead would parse, but leave a visible `\`
+/// on screen and still count as line drift. Interpreting it as a newline
+/// matches the source structure in the observed cases, and any misjudgement
+/// still surfaces through `assemble_reply`'s line-count check rather than
+/// passing silently.
 ///
 /// A legal escape is `\` followed by `" \ / b f n r t`, or `\u` plus four
-/// hex digits. Everything else becomes `\\` and the following character is
-/// then scanned normally, so `\z` yields `\\z` — a literal backslash and a
-/// `z`, which is what the model meant to write.
+/// hex digits — those are copied through untouched.
 fn repair_invalid_escapes(json: &str) -> String {
     let chars: Vec<char> = json.chars().collect();
     let mut out = String::with_capacity(json.len());
@@ -582,7 +619,7 @@ fn repair_invalid_escapes(json: &str) -> String {
                 out.push(next.expect("checked above"));
                 i += 2;
             } else {
-                out.push_str("\\\\");
+                out.push_str("\\n"); // the botched line separator
                 i += 1;
             }
             continue;
@@ -1141,8 +1178,11 @@ mod tests {
         let parsed: Value = serde_json::from_str(&fixed).expect("must parse now");
         assert_eq!(
             parsed["1"],
-            json!("- Хората имат много мнения\\за това кой си ти.")
+            json!("- Хората имат много мнения\nза това кой си ти.")
         );
+        // Interpreting it as a separator rather than a stray character also
+        // restores the two-line structure the source had.
+        assert_eq!(parsed["1"].as_str().unwrap().lines().count(), 2);
 
         // Every legal escape survives untouched.
         for good in [
@@ -1157,18 +1197,45 @@ mod tests {
             assert_eq!(repair_json(good), good, "must not rewrite {good}");
         }
 
-        // `\u` not followed by four hex digits is not a legal escape.
+        // `\u` not followed by four hex digits is not a legal escape. Only
+        // the backslash is rewritten — the `uZZ` that followed is model text
+        // and is kept, since eating characters would be a second guess about
+        // intent on top of the first.
         let bad_u = repair_invalid_escapes(r#"{"1":"\uZZ"}"#);
-        assert_eq!(bad_u, r#"{"1":"\\uZZ"}"#);
+        assert_eq!(bad_u, r#"{"1":"\nuZZ"}"#);
 
         // A trailing backslash with nothing after it is also invalid.
         let trailing = repair_invalid_escapes(r#"{"1":"x\"#);
-        assert_eq!(trailing, r#"{"1":"x\\"#);
+        assert_eq!(trailing, r#"{"1":"x\n"#);
 
         // Backslashes outside strings are not the model's escape usage and
         // are left for serde_json to complain about honestly.
         let outside = repair_invalid_escapes(r#"\z{"1":"a"}"#);
         assert_eq!(outside, r#"\z{"1":"a"}"#);
+    }
+
+    #[test]
+    fn straightens_curly_quotes_only_when_the_straight_parse_failed() {
+        // Observed killing batch 21 three attempts running: values closed
+        // with ” or “ instead of ".
+        let curly_right = "\"1\": \"- Джеф Гласър\\nсе оказыва...”,\n  \"2\": \"лъжец.\"";
+        let reply = format!("{{{curly_right}}}");
+        let map = parse_translations(&reply, 2).expect("fallback must recover it");
+        assert_eq!(map[&1], "- Джеф Гласър\nсе оказыва...");
+        assert_eq!(map[&2], "лъжец.");
+
+        // A left curly quote used as the closer is handled the same way.
+        let curly_left = r#"{"1":"Искат\nда интервюират Анжели.“}"#;
+        let map = parse_translations(curly_left, 1).expect("fallback must recover it");
+        assert_eq!(map[&1], "Искат\nда интервюират Анжели.");
+
+        // Healthy replies are never rewritten — Bulgarian legitimately uses
+        // “ ” as quotation marks, and straightening them mid-value would
+        // terminate the string early and corrupt the text.
+        let healthy = r#"{"1":"Той каза “не” наистина"}"#;
+        assert_eq!(repair_json(healthy), healthy);
+        let map = parse_translations(healthy, 1).unwrap();
+        assert_eq!(map[&1], "Той каза “не” наистина");
     }
 
     #[test]
