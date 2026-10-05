@@ -32,7 +32,7 @@ OPTIONS:
 
 CONFIG (all fields optional):
     { \"endpoint\": \"http://127.0.0.1:8001/v1/chat/completions\",
-      \"api_key\": \"\", \"model\": \"qwen\", \"temperature\": 0.2,
+      \"api_key\": \"\", \"model\": \"gemma-3-4b-it\", \"temperature\": 0.2,
       \"max_tokens\": 2048, \"timeout_secs\": 180, \"retries\": 2,
       \"batch_size\": 8, \"max_batch_chars\": 1500,
       \"disable_thinking\": true, \"system_prompt\": null }

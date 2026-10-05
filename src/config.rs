@@ -38,7 +38,7 @@ impl Default for Config {
         Self {
             endpoint: "http://127.0.0.1:8001/v1/chat/completions".to_string(),
             api_key: String::new(),
-            model: "qwen".to_string(),
+            model: "gemma-3-4b-it".to_string(),
             temperature: 0.2,
             max_tokens: 2048,
             timeout_secs: 180,

@@ -541,7 +541,60 @@ fn slice_by_chars(text: &str, from: usize, to: usize) -> &str {
 /// untouched — a repair that corrupts good JSON is worse than the failure it
 /// fixes, because it converts a clean error into a silently wrong result.
 fn repair_json(json: &str) -> String {
-    repair_doubled_key_quotes(&escape_control_chars_in_strings(json))
+    repair_invalid_escapes(&repair_doubled_key_quotes(&escape_control_chars_in_strings(json)))
+}
+
+/// Double any backslash inside a string that does not introduce a legal
+/// escape, turning it into a literal backslash.
+///
+/// Models emit these when they mangle a line break: `мнения\за` where a `\n`
+/// was intended. serde_json rejects the whole reply over it, so one bad
+/// escape costs every cue in the batch — that is how a single cue ended up
+/// untranslated after four separate attempts.
+///
+/// A legal escape is `\` followed by `" \ / b f n r t`, or `\u` plus four
+/// hex digits. Everything else becomes `\\` and the following character is
+/// then scanned normally, so `\z` yields `\\z` — a literal backslash and a
+/// `z`, which is what the model meant to write.
+fn repair_invalid_escapes(json: &str) -> String {
+    let chars: Vec<char> = json.chars().collect();
+    let mut out = String::with_capacity(json.len());
+    let mut in_string = false;
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i];
+
+        if ch == '\\' && in_string {
+            let next = chars.get(i + 1).copied();
+            let valid = match next {
+                Some(n) => {
+                    matches!(n, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't')
+                        || (n == 'u'
+                            && (i + 2..i + 6).all(|k| {
+                                chars.get(k).is_some_and(|c| c.is_ascii_hexdigit())
+                            }))
+                }
+                None => false,
+            };
+            if valid {
+                out.push('\\');
+                out.push(next.expect("checked above"));
+                i += 2;
+            } else {
+                out.push_str("\\\\");
+                i += 1;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = !in_string;
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
 }
 
 /// Remove the extra opening quote models sometimes put before object keys:
@@ -1077,6 +1130,45 @@ mod tests {
         let map = parse_translations(reply, 2).unwrap();
         assert_eq!(map[&1], "Здравей");
         assert_eq!(map[&2], "Добър");
+    }
+
+    #[test]
+    fn repairs_invalid_escape_sequences() {
+        // The exact reply that cost cue 53: a backslash before Cyrillic text
+        // where a newline was intended. serde_json rejects the whole batch.
+        let broken = r#"{"1":"- Хората имат много мнения\за това кой си ти."}"#;
+        let fixed = repair_json(broken);
+        let parsed: Value = serde_json::from_str(&fixed).expect("must parse now");
+        assert_eq!(
+            parsed["1"],
+            json!("- Хората имат много мнения\\за това кой си ти.")
+        );
+
+        // Every legal escape survives untouched.
+        for good in [
+            r#"{"1":"a\nb"}"#,
+            r#"{"1":"tab\there"}"#,
+            r#"{"1":"quote\"inside"}"#,
+            r#"{"1":"back\\slash"}"#,
+            r#"{"1":"sl/ash"}"#,
+            r#"{"1":"Здравей"}"#,
+            r#"{"1":"\u0417дравей"}"#,
+        ] {
+            assert_eq!(repair_json(good), good, "must not rewrite {good}");
+        }
+
+        // `\u` not followed by four hex digits is not a legal escape.
+        let bad_u = repair_invalid_escapes(r#"{"1":"\uZZ"}"#);
+        assert_eq!(bad_u, r#"{"1":"\\uZZ"}"#);
+
+        // A trailing backslash with nothing after it is also invalid.
+        let trailing = repair_invalid_escapes(r#"{"1":"x\"#);
+        assert_eq!(trailing, r#"{"1":"x\\"#);
+
+        // Backslashes outside strings are not the model's escape usage and
+        // are left for serde_json to complain about honestly.
+        let outside = repair_invalid_escapes(r#"\z{"1":"a"}"#);
+        assert_eq!(outside, r#"\z{"1":"a"}"#);
     }
 
     #[test]

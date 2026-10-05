@@ -20,31 +20,94 @@ export PATH="/Users/fi4o/.cargo/bin:/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin
 Commands (run from the repo root):
 
 ```sh
-cargo build                 # debug build
+cargo build                 # debug build   -> target/debug/srt2bg
+cargo build -r              # release build -> target/release/srt2bg (optimized; this is the one to benchmark)
 cargo test                  # unit tests (srt parsing, config, batching, response parsing)
 cargo run -- movie.srt      # translate, writes movie.bg.srt
 ```
+
+`-r` is cargo's shorthand for `--release`. Live runs and timing comparisons
+should use `target/release/srt2bg`; the debug binary is several times slower
+and would skew any measurement.
 
 Edition: 2024 (rustc 1.99+).
 
 ## Translation backend
 
 Translation is done by an **OpenAI-compatible chat completions endpoint**, not a
-dedicated translation API. At the time of writing this is a local Lemonade
-server (llama-server, Qwen3.5-0.8B) on `http://127.0.0.1:8001/v1/chat/completions`.
+dedicated translation API. This is a local Lemonade server (llama-server) on
+`http://127.0.0.1:8001/v1/chat/completions`.
+
+**Default model: `gemma-3-4b-it`** (config `model`). See "Model choice" below
+for why, and for the measurements behind it.
 
 Endpoint details that matter:
 
 - No auth by default; `api_key` in config is optional and sent as a Bearer token.
-- The model is a **reasoning model**: without intervention it spends all tokens
-  on `reasoning_content` and returns empty `content`. Requests must include
-  `"chat_template_kwargs": {"enable_thinking": false}` (config flag
-  `disable_thinking`, default `true`).
+- The `model` field is **not validated** by llama-server — any string is
+  accepted — so it documents intent rather than selecting anything. The model
+  actually served is whichever one Lemonade has loaded (`lemonade status`), and
+  only one LLM fits at a time. Switching models means reloading Lemonade, not
+  editing this config.
+- Qwen3.5 is a **reasoning model**: without intervention it spends all tokens
+  on `reasoning_content` and returns empty `content`. Those requests must
+  include `"chat_template_kwargs": {"enable_thinking": false}` (config flag
+  `disable_thinking`). That field is a llama-server extension, not part of the
+  OpenAI API. Gemma's chat template has no such variable and ignores it —
+  verified by running with and without — so the flag stays at its default
+  `true`: harmless for Gemma, and the only setting that works for Qwen.
 - The reply content may be wrapped in ```` ```json ```` fences even when
   `response_format` is requested — strip fences and locate the outer `{...}`
   before parsing.
 - `response_format: {"type":"json_object"}` is not relied upon; prompts demand
   raw JSON and the parser tolerates extra prose/fences.
+
+### Model choice
+
+Measured on the same 120 cues from `Angelyne.S01E01`, identical input,
+release build, `batch_size 4` / `max_batch_chars 400`:
+
+| model | untranslated | coverage | line drift | runtime | binary |
+|---|---|---|---|---|---|
+| Qwen3.5-0.8B | 6 | 94.2% | 36 | 610 s | *pre-fix* |
+| Qwen3.5-2B | 6 | 92.5% | 17 | 1544 s | current |
+| **Gemma-3-4b-it** | **2** | **98.3%** | **2** | **651 s** | current |
+
+The **2B vs Gemma rows are the valid head-to-head** — same binary, same input.
+The 0.8B row predates reply validation and the JSON repairs, so treat it as a
+rough historical baseline rather than a like-for-like comparison; it is kept
+because it shows where the pipeline started.
+
+Gemma wins on both quality and speed. The larger Qwen was ~2.4× *slower*
+despite being only ~2× bigger, because it spent most of that time on retries:
+it repeatedly echoed its input back verbatim (see "Reply validation") and
+mangled JSON in other ways. Gemma never echoed once. It is also officially
+multilingual with Bulgarian listed, which shows in fluency — the 0.8B produced
+nonsense such as `Съма се като икон.`
+
+**Recommendation: treat ~4B parameters as the minimum usable size.** Both
+sub-4B models were qualitatively worse, not marginally worse — 17–36 cues per
+120 came back with the wrong number of lines (the model merging two subtitle
+lines into one, which breaks on-screen layout), and both needed heavy retry
+traffic to reach ~93% coverage. At 4B those failures dropped to 2 and coverage
+reached 98.3% with no retry storm. If a candidate model cannot hold line
+structure, it is not usable for subtitles regardless of how fluent its
+sentences sound.
+
+Two caveats so this is not over-read:
+
+- Only one 4B model was measured, and it differs from the Qwens in *family*
+  as well as size — so "Gemma beat Qwen" and "4B beat 2B" are not separable
+  from this data alone. The safe conclusion is the conservative one: below 4B
+  the results are bad enough to rule those models out, and 4B is the smallest
+  size demonstrated to work.
+- Coverage and line drift are structural measures. They say nothing about
+  idiomatic phrasing, so a fluent-sounding result still needs a human
+  spot-check before use.
+
+Translation quality remains bounded by whatever model the config points at;
+the pipeline repairs *structure* (line counts, tags, JSON) but cannot make a
+weak model fluent.
 
 ## Translation strategy: batched blocks
 
@@ -69,8 +132,8 @@ does not depend on model obedience:
 2. The model translates placeholder-bearing text.
 3. `restore_markup` substitutes placeholders back (case-insensitively),
    **strips hallucinated residue** (`<t0>`, `</t0>` the model invented — a
-   prompt that names concrete examples reliably makes an 0.8B model emit them),
-   and **re-inserts dropped tags** at their original position when that
+   prompt that names concrete examples reliably makes a small model emit
+   them), and **re-inserts dropped tags** at their original position when that
    position is unambiguous (leading → front, trailing → back; mid-text tags
    cannot be placed and are reported).
 
@@ -111,8 +174,8 @@ silently off by one, which is easy to miss because the counts stay correct.
 
 ### Malformed JSON from small models
 
-Three failures were observed in practice and are repaired before `serde_json`
-is called, both covered by unit tests:
+Four failures were observed in practice and are repaired before `serde_json`
+is called, all covered by unit tests:
 
 - **Raw newlines inside string values** — the model writes a literal `\n`
   where the JSON spec wants `\\n`. `escape_control_chars_in_strings` rewrites
@@ -127,8 +190,13 @@ is called, both covered by unit tests:
   batch attempt failed until `repair_doubled_key_quotes` collapsed `""<digits>"`
   to `"<digits>"`. A bare `"` is never legal inside a JSON string (it must be
   `\"`), so the pattern cannot occur in valid JSON and the repair is safe.
+- **An illegal escape sequence** — `мнения\за`, a backslash before Cyrillic
+  text where a newline was meant. `repair_invalid_escapes` doubles any
+  backslash not followed by `" \ / b f n r t` or four hex digits after `u`.
+  One bad escape costs every cue in the batch, and it is what left a cue
+  untranslated through three batch attempts *and* its single-cue retry.
 
-All three run through `repair_json`, the single entry point called before
+All four run through `repair_json`, the single entry point called before
 `serde_json`. New repairs belong there — each pass must leave already-valid
 text untouched, since a repair that corrupts good JSON turns a clean error
 into a silently wrong result.
@@ -182,8 +250,14 @@ CLI overrides exist for the common ones (`--model`, `--endpoint`,
 ## Known model limitation
 
 Translation *quality* is bounded by whatever model the config points at. The
-verified setup uses Qwen3.5-**0.8B**, which frequently merges two cue lines
-into one, mistranslates idioms, and invents placeholder-shaped tokens. The
-pipeline detects and repairs structure (lines, tags) but cannot make an 0.8B
-model fluent — expect to raise `model`/`endpoint` in `srt2bg.json` for
-production-quality Bulgarian.
+pipeline detects and repairs *structure* — line counts, markup tags, malformed
+JSON — but it cannot make a weak model fluent. Qwen3.5-0.8B, the original
+target, frequently merged two cue lines into one, mistranslated idioms,
+invented placeholder-shaped tokens, and sometimes echoed its input back
+verbatim rather than translating at all.
+
+The default is now `gemma-3-4b-it`, which measured markedly better on every
+axis; see "Model choice" for the numbers. If you point `model` elsewhere,
+expect to re-verify line drift and coverage rather than assume parity — and
+note that no local model reaches professional quality, so spot-check output
+before shipping it.
