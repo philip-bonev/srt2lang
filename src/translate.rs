@@ -43,9 +43,13 @@ pub enum Degradation {
     Lines { source: usize, result: usize },
     /// The model dropped markup tags; they were re-inserted by guess.
     Markup { tags: String },
+    /// The model returned no Bulgarian — it echoed English back instead.
+    Untranslated,
 }
 
-/// Per-run quality report: every degradation, by file cue index.
+/// Per-run quality report: every degradation, keyed by **0-based file
+/// position** — the same space as `Item::index`. Callers printing cue numbers
+/// must convert with `+ 1`, since SRT cues are numbered from 1.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Report {
     pub degradations: Vec<(usize, Degradation)>,
@@ -73,6 +77,45 @@ impl Report {
             .map(|(i, _)| *i)
             .collect()
     }
+
+    /// Cue indices the model answered in English rather than Bulgarian.
+    pub fn untranslated_issues(&self) -> Vec<usize> {
+        self.degradations
+            .iter()
+            .filter(|(_, d)| matches!(d, Degradation::Untranslated))
+            .map(|(i, _)| *i)
+            .collect()
+    }
+}
+
+/// True when `reply` gives no sign of having been translated at all.
+///
+/// This check exists because a small model sometimes echoes its input
+/// verbatim. Such a reply passes *every* structural test — keys intact,
+/// placeholders present, line counts matching — so without a language check
+/// it is accepted silently and reported as a success while the cue stays in
+/// English. See `looks_untranslated`.
+///
+/// Single-word sources are excluded: `- Ooh.`, `- Cory?`, `Angelyne` are
+/// correctly left in Latin script, and flagging them would only buy useless
+/// retries. A multi-word English sentence coming back with zero Cyrillic, on
+/// the other hand, is never a translation.
+fn looks_untranslated(source: &str, reply: &str) -> bool {
+    !has_cyrillic(reply) && latin_words(source) >= 2
+}
+
+/// Whether `text` contains any Cyrillic character (U+0400–U+04FF).
+fn has_cyrillic(text: &str) -> bool {
+    text.chars()
+        .any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+}
+
+/// Count runs of ASCII letters at least two characters long — i.e. words that
+/// could only be Latin-script English.
+fn latin_words(text: &str) -> usize {
+    text.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| w.len() >= 2)
+        .count()
 }
 
 /// Group consecutive items into batches, bounded by both `batch_size` cues
@@ -194,7 +237,7 @@ fn translate_batch(
                     if partial == AcceptPartial::Reject {
                         for index in lost {
                             eprintln!(
-                                "  cue {}: structure not preserved (markup/line count), retrying alone",
+                                "  cue {}: not usable as batch reply (markup/line count/no Bulgarian), retrying alone",
                                 index + 1
                             );
                         }
@@ -251,9 +294,17 @@ fn assemble_reply(
         let source_lines = count_lines(&item.text);
         let result_lines = count_lines(text);
         let merged = source_lines != result_lines;
-        if (!dropped.is_empty() || merged) && partial == AcceptPartial::Reject {
+        let untranslated = looks_untranslated(&item.text, text);
+        if (untranslated || !dropped.is_empty() || merged) && partial == AcceptPartial::Reject {
             lost.push(item.index);
             continue;
+        }
+        if untranslated {
+            report.push(item.index, Degradation::Untranslated);
+            eprintln!(
+                "  cue {}: model answered in English, no Bulgarian in reply",
+                item.index + 1
+            );
         }
         if !dropped.is_empty() {
             let (restored, unplaced) = restore_markup(text, source, tags);
@@ -396,7 +447,7 @@ fn parse_translations(content: &str, expected: usize) -> Result<BTreeMap<usize, 
     let mut found: BTreeMap<usize, String> = BTreeMap::new();
 
     for candidate in json_object_candidates(stripped) {
-        let repaired = escape_control_chars_in_strings(candidate);
+        let repaired = repair_json(candidate);
         let Ok(parsed) = serde_json::from_str::<Value>(&repaired) else {
             continue;
         };
@@ -482,6 +533,45 @@ fn slice_by_chars(text: &str, from: usize, to: usize) -> &str {
         .map(|(i, _)| i)
         .unwrap_or(text.len());
     &text[start..end]
+}
+
+/// Every repair small models need before `serde_json` can read their reply.
+///
+/// Passes are independent, and each one must leave already-valid text
+/// untouched — a repair that corrupts good JSON is worse than the failure it
+/// fixes, because it converts a clean error into a silently wrong result.
+fn repair_json(json: &str) -> String {
+    repair_doubled_key_quotes(&escape_control_chars_in_strings(json))
+}
+
+/// Remove the extra opening quote models sometimes put before object keys:
+/// `{"1":"a.",""2":"b."}` instead of `{"1":"a.","2":"b."}`.
+///
+/// The pattern is `""` followed by digits and a closing quote — an opening
+/// quote immediately before digits can only be a key delimiter, since a bare
+/// `"` is not legal *inside* a JSON string (it must be `\"`). So this cannot
+/// rewrite valid JSON; it only fires where the reply is already broken.
+fn repair_doubled_key_quotes(json: &str) -> String {
+    let chars: Vec<char> = json.chars().collect();
+    let mut out = String::with_capacity(json.len());
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if chars[i] == '"' && chars.get(i + 1) == Some(&'"') {
+            let mut j = i + 2;
+            while chars.get(j).is_some_and(|c| c.is_ascii_digit()) {
+                j += 1;
+            }
+            if j > i + 2 && chars.get(j) == Some(&'"') {
+                out.push('"'); // collapse the two opening quotes into one
+                i += 2;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Escape raw control characters (U+0000–U+001F) that appear *inside* JSON
@@ -990,6 +1080,37 @@ mod tests {
     }
 
     #[test]
+    fn repairs_doubled_key_quotes() {
+        // Observed from the 2B model: every key after the first gained a
+        // second opening quote, which serde_json rejects outright.
+        let broken = r#"{"1":"- Благодаря.",""2":"- Да, тя е била.",""3":"- Кори?"}"#;
+        let fixed = repair_json(broken);
+        let parsed: Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(parsed["2"], json!("- Да, тя е била."));
+        assert_eq!(parsed["3"], json!("- Кори?"));
+
+        // The first key is unaffected and valid replies are left alone.
+        let good = r#"{"1":"a","2":"b"}"#;
+        assert_eq!(repair_json(good), good);
+
+        // Escaped quotes inside a value are not key delimiters: `\""` here is
+        // an escaped quote followed by the string's closing quote.
+        let quoted = r#"{"1":"he said \"5\" ok"}"#;
+        assert_eq!(repair_json(quoted), quoted);
+
+        // `""` not followed by digits is not a key delimiter and is left
+        // alone — e.g. a doubled quote mid-value in an already-broken reply.
+        assert_eq!(
+            repair_doubled_key_quotes(r#"{"1":"she said ""hi""}"#),
+            r#"{"1":"she said ""hi""}"#
+        );
+        assert_eq!(
+            repair_doubled_key_quotes(r#"{"1":"a","2":"b"}"#),
+            r#"{"1":"a","2":"b"}"#
+        );
+    }
+
+    #[test]
     fn repairs_raw_newlines_inside_json_strings() {
         // Exactly what the model returned for cue 12 of the Angelyne file:
         // a raw newline inside the value, and an escaped quote at the start.
@@ -1024,6 +1145,45 @@ mod tests {
         let fixed = escape_control_chars_in_strings(broken);
         let parsed: Value = serde_json::from_str(&fixed).unwrap();
         assert_eq!(parsed["1"].as_str().unwrap(), "a\u{0001}b");
+    }
+
+    #[test]
+    fn detects_echoed_english_but_spares_names_and_interjections() {
+        // Verbatim echo of a multi-word sentence: no Cyrillic at all.
+        assert!(looks_untranslated(
+            "featuring the striking image",
+            "<t0>featuring the striking image<t1>"
+        ));
+        assert!(looks_untranslated("what they see.", "what they see."));
+        assert!(looks_untranslated(
+            "- I love Angelyne",
+            "- I love Angelyne"
+        ));
+
+        // Correctly left in Latin script — names, numbers, interjections.
+        assert!(!looks_untranslated("- Angelyne.", "- Angelyne."));
+        assert!(!looks_untranslated("Oh.", "Oh."));
+        assert!(!looks_untranslated("2019", "2019"));
+        assert!(!looks_untranslated("Paris", "Пари"));
+
+        // A real translation always contains Cyrillic.
+        assert!(!looks_untranslated(
+            "featuring the striking image",
+            "<t0>със striking образ<t1>"
+        ));
+    }
+
+    #[test]
+    fn latin_words_counts_only_multi_letter_runs() {
+        assert_eq!(latin_words("featuring the striking image"), 4);
+        assert_eq!(latin_words("- Ooh."), 1);
+        assert_eq!(latin_words("Oh."), 1);
+        assert_eq!(latin_words("Angelyne"), 1);
+        assert_eq!(latin_words("2019"), 0);
+        assert_eq!(latin_words("<t0>featuring the image<t1>"), 3);
+        assert!(has_cyrillic("Здравей"));
+        assert!(!has_cyrillic("hello"));
+        assert!(!has_cyrillic(""));
     }
 
     #[test]
@@ -1069,6 +1229,58 @@ mod tests {
             assemble_reply(reply, &batch, &protected, AcceptPartial::Reject, &mut report);
         assert!(out.is_empty());
         assert_eq!(lost, vec![3]);
+        assert!(report.degradations.is_empty());
+    }
+
+    #[test]
+    fn assemble_reply_rejects_echoed_english_for_retry_then_keeps_it() {
+        // A verbatim echo: valid JSON, placeholders intact, line count
+        // matching — the language check is the only thing that catches it.
+        let batch = vec![item(3, "featuring the striking image")];
+        let protected = vec![(
+            "featuring the striking image".to_string(),
+            vec!["<i>".to_string(), "</i>".to_string()],
+        )];
+        let reply = BTreeMap::from([(
+            1,
+            "<t0>featuring the striking image<t1>".to_string(),
+        )]);
+
+        // Batch pass: rejected so the cue is retried on its own.
+        let mut report = Report::default();
+        let (out, lost) =
+            assemble_reply(reply.clone(), &batch, &protected, AcceptPartial::Reject, &mut report);
+        assert!(out.is_empty(), "echoed English must not be accepted");
+        assert_eq!(lost, vec![3], "cue is queued for a single retry");
+        assert!(report.degradations.is_empty(), "rejections are not reported");
+
+        // Single-cue pass: nothing left to fall back to, so keep it — but
+        // record that it is English, so the summary is honest about it.
+        let mut report = Report::default();
+        let (out, lost) =
+            assemble_reply(reply, &batch, &protected, AcceptPartial::Accept, &mut report);
+        assert!(out.contains_key(&3), "kept rather than dropped");
+        assert!(lost.is_empty(), "Accept mode never drops a cue");
+        assert_eq!(report.untranslated_issues(), vec![3]);
+        assert_eq!(
+            report.degradations,
+            vec![(3, Degradation::Untranslated)]
+        );
+    }
+
+    #[test]
+    fn assemble_reply_accepts_a_properly_translated_cue() {
+        let batch = vec![item(3, "featuring the striking image")];
+        let protected = vec![(
+            "featuring the striking image".to_string(),
+            vec!["<i>".to_string(), "</i>".to_string()],
+        )];
+        let reply = BTreeMap::from([(1, "<t0>със strike образ<t1>".to_string())]);
+
+        let mut report = Report::default();
+        let (out, _lost) =
+            assemble_reply(reply, &batch, &protected, AcceptPartial::Reject, &mut report);
+        assert!(out.contains_key(&3));
         assert!(report.degradations.is_empty());
     }
 

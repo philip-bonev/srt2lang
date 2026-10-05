@@ -180,8 +180,11 @@ fn run(args: Args) -> Result<(), String> {
         .map(|(item, _)| item.index + 1)
         .collect();
 
-    let line_issues = report.line_issues();
-    let markup_issues = report.markup_issues();
+    // The Report keys degradations by 0-based file position (the same space
+    // as `Item::index`), but cue numbers shown to the user are 1-based.
+    let line_issues = cue_numbers(report.line_issues());
+    let markup_issues = cue_numbers(report.markup_issues());
+    let english_issues = cue_numbers(report.untranslated_issues());
 
     let output_path = match args.output {
         Some(p) => PathBuf::from(p),
@@ -201,6 +204,13 @@ fn run(args: Args) -> Result<(), String> {
             list_cues(&unchanged)
         );
     }
+    if !english_issues.is_empty() {
+        eprintln!(
+            "  kept in English     : {}  -> {}",
+            english_issues.len(),
+            list_cues(&english_issues)
+        );
+    }
     if !line_issues.is_empty() {
         eprintln!(
             "  line structure drift: {}  -> {}",
@@ -218,7 +228,11 @@ fn run(args: Args) -> Result<(), String> {
     if failed > 0 {
         eprintln!("  left in English     : {failed}");
     }
-    if unchanged.is_empty() && line_issues.is_empty() && markup_issues.is_empty() && failed == 0
+    if unchanged.is_empty()
+        && english_issues.is_empty()
+        && line_issues.is_empty()
+        && markup_issues.is_empty()
+        && failed == 0
     {
         eprintln!("  no issues detected");
     }
@@ -234,6 +248,13 @@ fn run(args: Args) -> Result<(), String> {
         }
     );
     Ok(())
+}
+
+/// Convert 0-based file positions (as `Report` stores them) into the 1-based
+/// cue numbers the SRT displays. Forgetting this is an easy way to print a
+/// summary that is silently off by one — see the test below.
+fn cue_numbers(positions: Vec<usize>) -> Vec<usize> {
+    positions.into_iter().map(|i| i + 1).collect()
 }
 
 /// Render cue numbers (1-based) compactly: `14, 15, 20 +3`.
@@ -282,6 +303,14 @@ mod tests {
 
     fn parse(list: &[&str]) -> Result<CliAction, String> {
         parse_args(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn report_positions_are_printed_as_one_based_cue_numbers() {
+        // `Report` stores 0-based file positions; cue 1 is position 0.
+        // (translate tests pin `Report` to 0-based; this pins the conversion.)
+        assert_eq!(cue_numbers(vec![0, 4, 119]), vec![1, 5, 120]);
+        assert_eq!(cue_numbers(vec![]), Vec::<usize>::new());
     }
 
     #[test]

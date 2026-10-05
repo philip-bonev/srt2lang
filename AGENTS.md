@@ -78,11 +78,60 @@ does not depend on model obedience:
 
 1. Batch request; parse the returned JSON object (fences/prose tolerated).
 2. A cue is **rejected** if it is missing from the reply, dropped a
-   placeholder, or changed its line count (SRT line structure is display
-   structure) → retried as a single-cue request.
+   placeholder, changed its line count (SRT line structure is display
+   structure), or **came back with no Bulgarian** → retried as a single-cue
+   request.
 3. The single-cue reply is **accepted** even if imperfect (better a
-   translation with a warning than English text), with the markup repair above.
+   translation with a warning than English text), with the markup repair
+   above. If it still has no Bulgarian, `Degradation::Untranslated` is
+   recorded so the summary says so.
 4. Still nothing → keep the original English text and report a warning.
+
+### Reply validation
+
+Structural checks are not enough: a small model sometimes **echoes its input
+verbatim**, placeholders and all. Such a reply has correct keys, intact
+placeholders and matching line counts — it passes every structural test while
+remaining English. `looks_untranslated` therefore requires Cyrillic in any
+reply to a multi-word Latin-script cue. Sources of fewer than two Latin words
+(`- Ooh.`, `- Cory?`, `Angelyne`, `2019`) are exempt: those are correctly left
+in Latin script, and flagging them only buys useless retries.
+
+`translate_items` returns a `Report` alongside the results. It records every
+cue that was accepted *but* imperfect — `Lines`, `Markup`, `Untranslated` —
+because a run's failures alone understate the picture: most degraded cues are
+accepted, not rejected. `main.rs` prints these as a `--- quality ---` summary.
+Rejections are deliberately *not* recorded; they are retried, so counting them
+would double-count the eventual outcome.
+
+`Report` keys entries by **0-based file position**, matching `Item::index`.
+SRT cues are numbered from 1, so anything user-facing must go through
+`cue_numbers()` — printing the raw positions yields a summary that is
+silently off by one, which is easy to miss because the counts stay correct.
+
+### Malformed JSON from small models
+
+Three failures were observed in practice and are repaired before `serde_json`
+is called, both covered by unit tests:
+
+- **Raw newlines inside string values** — the model writes a literal `\n`
+  where the JSON spec wants `\\n`. `escape_control_chars_in_strings` rewrites
+  them, leaving newlines *between* tokens alone so pretty-printed replies
+  still parse.
+- **Naive `{`…`}` extraction** — "first `{` to last `}`" produces an
+  unparseable slice when the reply holds two objects, a `}` in trailing
+  prose, or an unbalanced `{` in prose. `json_object_candidates` instead
+  balances each opening brace independently (skipping braces inside string
+  literals) and the findings are merged.
+- **A doubled quote before object keys** — `{"1":"a.",""2":"b."}`. Every
+  batch attempt failed until `repair_doubled_key_quotes` collapsed `""<digits>"`
+  to `"<digits>"`. A bare `"` is never legal inside a JSON string (it must be
+  `\"`), so the pattern cannot occur in valid JSON and the repair is safe.
+
+All three run through `repair_json`, the single entry point called before
+`serde_json`. New repairs belong there — each pass must leave already-valid
+text untouched, since a repair that corrupts good JSON turns a clean error
+into a silently wrong result.
 
 Failed batches retry `config.retries` times before falling back. Progress and
 warnings go to stderr and name the cue number, so a run's decisions are
