@@ -1,6 +1,6 @@
 [package]
 name = "srt2bg"
-version = "0.0.1"
+version = "1.0.0"
 edition = "2024"
 description = "Console tool that translates English SRT subtitles to Bulgarian via an OpenAI-compatible LLM endpoint"
 
