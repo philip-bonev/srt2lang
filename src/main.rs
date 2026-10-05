@@ -158,10 +158,10 @@ fn run(args: Args) -> Result<(), String> {
         cfg.model
     );
 
-    let translated = translate::translate_items(&cfg, &items);
+    let (translated, report) = translate::translate_items(&cfg, &items);
 
     let mut failed = 0usize;
-    for (item, text) in items.iter().zip(translated) {
+    for (item, text) in items.iter().zip(&translated) {
         match text {
             Some(text) => parsed.cues[item.index].text = text.split('\n').map(str::to_string).collect(),
             None => {
@@ -171,12 +171,57 @@ fn run(args: Args) -> Result<(), String> {
         }
     }
 
+    // Cues whose text came back byte-identical to the source: the model
+    // "succeeded" but produced no translation at all.
+    let unchanged: Vec<usize> = items
+        .iter()
+        .zip(translated.iter())
+        .filter(|(item, t)| t.as_deref() == Some(item.text.as_str()))
+        .map(|(item, _)| item.index + 1)
+        .collect();
+
+    let line_issues = report.line_issues();
+    let markup_issues = report.markup_issues();
+
     let output_path = match args.output {
         Some(p) => PathBuf::from(p),
         None => default_output_path(&input_path),
     };
     std::fs::write(&output_path, srt::serialize(&parsed))
         .map_err(|e| format!("cannot write '{}': {e}", output_path.display()))?;
+
+    // Quality summary: failures alone understate the picture, since a cue can
+    // be "translated" yet still differ from what was asked for.
+    eprintln!("--- quality ---");
+    eprintln!("  translated          : {}", items.len() - failed);
+    if !unchanged.is_empty() {
+        eprintln!(
+            "  unchanged (no-op)   : {}  -> {}",
+            unchanged.len(),
+            list_cues(&unchanged)
+        );
+    }
+    if !line_issues.is_empty() {
+        eprintln!(
+            "  line structure drift: {}  -> {}",
+            line_issues.len(),
+            list_cues(&line_issues)
+        );
+    }
+    if !markup_issues.is_empty() {
+        eprintln!(
+            "  markup repaired     : {}  -> {}",
+            markup_issues.len(),
+            list_cues(&markup_issues)
+        );
+    }
+    if failed > 0 {
+        eprintln!("  left in English     : {failed}");
+    }
+    if unchanged.is_empty() && line_issues.is_empty() && markup_issues.is_empty() && failed == 0
+    {
+        eprintln!("  no issues detected");
+    }
 
     eprintln!(
         "wrote {} ({} cue(s){})",
@@ -189,6 +234,20 @@ fn run(args: Args) -> Result<(), String> {
         }
     );
     Ok(())
+}
+
+/// Render cue numbers (1-based) compactly: `14, 15, 20 +3`.
+fn list_cues(cues: &[usize]) -> String {
+    const SHOWN: usize = 8;
+    if cues.len() <= SHOWN {
+        cues.iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        let head: Vec<String> = cues[..SHOWN].iter().map(|c| c.to_string()).collect();
+        format!("{} +{}", head.join(", "), cues.len() - SHOWN)
+    }
 }
 
 fn main() -> ExitCode {

@@ -32,6 +32,49 @@ pub struct Item {
     pub text: String,
 }
 
+/// A cue that was translated, but not cleanly.
+///
+/// These are *not* failures — the text is usable — but they are exactly what
+/// a user reviewing a subtitle file cares about, so they are counted and
+/// summarised rather than left as scattered stderr lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Degradation {
+    /// The model returned fewer (or more) lines than the source cue had.
+    Lines { source: usize, result: usize },
+    /// The model dropped markup tags; they were re-inserted by guess.
+    Markup { tags: String },
+}
+
+/// Per-run quality report: every degradation, by file cue index.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub degradations: Vec<(usize, Degradation)>,
+}
+
+impl Report {
+    fn push(&mut self, index: usize, kind: Degradation) {
+        self.degradations.push((index, kind));
+    }
+
+    /// Cue indices whose line structure differs from the source.
+    pub fn line_issues(&self) -> Vec<usize> {
+        self.degradations
+            .iter()
+            .filter(|(_, d)| matches!(d, Degradation::Lines { .. }))
+            .map(|(i, _)| *i)
+            .collect()
+    }
+
+    /// Cue indices whose markup had to be repaired by guess.
+    pub fn markup_issues(&self) -> Vec<usize> {
+        self.degradations
+            .iter()
+            .filter(|(_, d)| matches!(d, Degradation::Markup { .. }))
+            .map(|(i, _)| *i)
+            .collect()
+    }
+}
+
 /// Group consecutive items into batches, bounded by both `batch_size` cues
 /// and `max_batch_chars` total characters (a single oversized cue forms its
 /// own batch). Items whose text is empty/whitespace are skipped entirely.
@@ -66,9 +109,10 @@ pub fn build_batches(
 
 /// Translate all items, returning a vector aligned with the input:
 /// `Some(bulgarian)` on success, `None` when every fallback failed
-/// (caller keeps the original text).
-pub fn translate_items(cfg: &Config, items: &[Item]) -> Vec<Option<String>> {
+/// (caller keeps the original text), plus a report of degraded cues.
+pub fn translate_items(cfg: &Config, items: &[Item]) -> (Vec<Option<String>>, Report) {
     let mut results: Vec<Option<String>> = vec![None; items.len()];
+    let mut report = Report::default();
 
     let batches = build_batches(items, cfg.batch_size, cfg.max_batch_chars);
     let total_batches = batches.len();
@@ -82,7 +126,7 @@ pub fn translate_items(cfg: &Config, items: &[Item]) -> Vec<Option<String>> {
             if batch.len() == 1 { "" } else { "s" }
         );
 
-        match translate_batch(cfg, batch, AcceptPartial::Reject) {
+        match translate_batch(cfg, batch, AcceptPartial::Reject, &mut report) {
             Ok(map) => {
                 for item in batch {
                     if let Some(text) = map.get(&item.index) {
@@ -98,7 +142,12 @@ pub fn translate_items(cfg: &Config, items: &[Item]) -> Vec<Option<String>> {
             if results[item.index].is_some() {
                 continue;
             }
-            match translate_batch(cfg, std::slice::from_ref(item), AcceptPartial::Accept) {
+            match translate_batch(
+                cfg,
+                std::slice::from_ref(item),
+                AcceptPartial::Accept,
+                &mut report,
+            ) {
                 Ok(map) => {
                     if let Some(text) = map.get(&item.index) {
                         results[item.index] = Some(text.clone());
@@ -112,7 +161,7 @@ pub fn translate_items(cfg: &Config, items: &[Item]) -> Vec<Option<String>> {
         }
     }
 
-    results
+    (results, report)
 }
 
 /// Send one batch and parse the reply into `file index -> translation`.
@@ -126,6 +175,7 @@ fn translate_batch(
     cfg: &Config,
     batch: &[Item],
     partial: AcceptPartial,
+    report: &mut Report,
 ) -> Result<BTreeMap<usize, String>, String> {
     // Hide markup from the model; restored after the reply.
     let protected: Vec<(String, Vec<String>)> =
@@ -139,7 +189,8 @@ fn translate_batch(
         match post_chat(cfg, &payload) {
             Ok(content) => match parse_translations(&content, batch.len()) {
                 Ok(positional) => {
-                    let (out, lost) = assemble_reply(positional, batch, &protected, partial);
+                    let (out, lost) =
+                        assemble_reply(positional, batch, &protected, partial, report);
                     if partial == AcceptPartial::Reject {
                         for index in lost {
                             eprintln!(
@@ -177,12 +228,14 @@ enum AcceptPartial {
 /// Map a parsed reply back onto the batch: positional key (1..n) → file
 /// index, with markup restored. Cues missing from the reply, or (when
 /// `AcceptPartial::Reject`) cues whose placeholders the model dropped, are
-/// omitted from the result and returned as lost.
+/// omitted from the result and returned as lost. Cues that survive but are
+/// imperfect are recorded in the report.
 fn assemble_reply(
     positional: BTreeMap<usize, String>,
     batch: &[Item],
     protected: &[(String, Vec<String>)],
     partial: AcceptPartial,
+    report: &mut Report,
 ) -> (BTreeMap<usize, String>, Vec<usize>) {
     let mut out = BTreeMap::new();
     let mut lost = Vec::new();
@@ -195,13 +248,25 @@ fn assemble_reply(
         };
 
         let dropped: Vec<&str> = missing_placeholders(text, tags);
-        let merged = count_lines(text) != count_lines(&item.text);
+        let source_lines = count_lines(&item.text);
+        let result_lines = count_lines(text);
+        let merged = source_lines != result_lines;
         if (!dropped.is_empty() || merged) && partial == AcceptPartial::Reject {
             lost.push(item.index);
             continue;
         }
         if !dropped.is_empty() {
             let (restored, unplaced) = restore_markup(text, source, tags);
+            report.push(
+                item.index,
+                Degradation::Markup {
+                    tags: if unplaced.is_empty() {
+                        dropped.join(", ")
+                    } else {
+                        format!("{} (unplaced: {})", dropped.join(", "), unplaced.join(", "))
+                    },
+                },
+            );
             if unplaced.is_empty() {
                 eprintln!(
                     "  cue {}: model dropped markup ({}), re-inserted at original position",
@@ -219,11 +284,18 @@ fn assemble_reply(
             continue;
         }
         if merged {
+            report.push(
+                item.index,
+                Degradation::Lines {
+                    source: source_lines,
+                    result: result_lines,
+                },
+            );
             eprintln!(
                 "  cue {}: model merged {} line(s) into {}, keeping translation",
                 item.index + 1,
-                count_lines(&item.text),
-                count_lines(text)
+                source_lines,
+                result_lines
             );
         }
         out.insert(item.index, restore_markup(text, source, tags).0);
@@ -314,39 +386,143 @@ fn post_chat(cfg: &Config, payload: &Value) -> Result<String, String> {
 
 /// Extract translations from raw model output, tolerating markdown fences
 /// and surrounding prose. Returns `1-based position -> translation`.
+///
+/// Candidate objects are found by balanced-brace scanning rather than
+/// "first `{` to last `}`": a model that emits two objects, or a `}` inside
+/// trailing prose, would otherwise produce an unparseable slice. The
+/// candidate yielding the most usable cues wins.
 fn parse_translations(content: &str, expected: usize) -> Result<BTreeMap<usize, String>, String> {
     let stripped = strip_fences(content);
-    let start = stripped
-        .find('{')
-        .ok_or_else(|| format!("no JSON object in reply: {}", truncate(content, 200)))?;
-    let end = stripped[start..]
-        .rfind('}')
-        .map(|p| start + p)
-        .ok_or_else(|| format!("unterminated JSON in reply: {}", truncate(content, 200)))?;
+    let mut found: BTreeMap<usize, String> = BTreeMap::new();
 
-    let parsed: Value = serde_json::from_str(&stripped[start..=end])
-        .map_err(|e| format!("invalid JSON in reply: {e}"))?;
-    let obj = parsed
-        .as_object()
-        .ok_or_else(|| "reply JSON is not an object".to_string())?;
+    for candidate in json_object_candidates(stripped) {
+        let repaired = escape_control_chars_in_strings(candidate);
+        let Ok(parsed) = serde_json::from_str::<Value>(&repaired) else {
+            continue;
+        };
+        let Some(obj) = parsed.as_object() else {
+            continue;
+        };
 
-    let mut out: BTreeMap<usize, String> = BTreeMap::new();
-    for (key, value) in obj {
-        if let Ok(pos) = key.parse::<usize>()
-            && (1..=expected).contains(&pos)
-                && let Some(text) = value.as_str()
-                    && !text.trim().is_empty() {
-                        out.insert(pos, text.to_string());
-                    }
+        for (key, value) in obj {
+            if let Ok(pos) = key.parse::<usize>()
+                && (1..=expected).contains(&pos)
+                    && let Some(text) = value.as_str()
+                        && !text.trim().is_empty()
+                        && !found.contains_key(&pos) {
+                            found.insert(pos, text.to_string());
+                        }
+        }
+        if found.len() == expected {
+            break; // every cue accounted for
+        }
     }
 
-    if out.is_empty() {
+    if found.is_empty() {
         return Err(format!(
             "no usable translations in reply: {}",
             truncate(content, 200)
         ));
     }
-    Ok(out)
+    Ok(found)
+}
+
+/// Balanced `{...}` objects found in `text`.
+///
+/// Each opening brace is tried independently, so an unbalanced `{` in
+/// surrounding prose cannot swallow the real object that follows it.
+/// Braces inside string literals are not structural.
+fn json_object_candidates(text: &str) -> Vec<&str> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+
+    for open in (0..chars.len()).filter(|&i| chars[i] == '{') {
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+
+        for (i, &ch) in chars.iter().enumerate().skip(open) {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        out.push(slice_by_chars(text, open, i));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Slice `text` from char index `from` through `to` inclusive.
+fn slice_by_chars(text: &str, from: usize, to: usize) -> &str {
+    let start = text
+        .char_indices()
+        .nth(from)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let end = text
+        .char_indices()
+        .nth(to + 1)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    &text[start..end]
+}
+
+/// Escape raw control characters (U+0000–U+001F) that appear *inside* JSON
+/// string literals — what small models emit for multi-line cue text instead
+/// of writing `\n`. serde_json rejects those, so without this a batch of
+/// ordinary two-line cues fails outright and every cue falls back to English.
+///
+/// Newlines and indentation *between* tokens are legal JSON whitespace and
+/// are left untouched, so pretty-printed replies still parse. Text outside
+/// strings is copied verbatim.
+fn escape_control_chars_in_strings(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in json.chars() {
+        if in_string && (ch as u32) < 0x20 {
+            match ch {
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                other => out.push_str(&format!("\\u{:04x}", other as u32)),
+            }
+            escaped = false;
+            continue;
+        }
+
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Replace markup tags with `<tN>` placeholders so they survive the model.
@@ -697,7 +873,7 @@ mod tests {
         ];
         let reply = BTreeMap::from([(1, "Първи".to_string()), (3, "Трети".to_string())]);
 
-        let (out, lost) = assemble_reply(reply, &batch, &protected, AcceptPartial::Reject);
+        let (out, lost) = assemble_reply(reply, &batch, &protected, AcceptPartial::Reject, &mut Report::default());
         assert_eq!(out.get(&10).map(String::as_str), Some("Първи"));
         assert_eq!(out.get(&12).map(String::as_str), Some("Трети"));
         assert!(!out.contains_key(&11));
@@ -711,13 +887,13 @@ mod tests {
         // Model kept the opening tag but dropped the closing one.
         let reply = BTreeMap::from([(1, "Здравей <t0>".to_string())]);
 
-        let (out, lost) = assemble_reply(reply.clone(), &batch, &protected, AcceptPartial::Reject);
+        let (out, lost) = assemble_reply(reply.clone(), &batch, &protected, AcceptPartial::Reject, &mut Report::default());
         assert!(out.is_empty(), "batch reply must drop the damaged cue");
         assert_eq!(lost, vec![0]);
 
         // Final single-cue fallback keeps the translation; the surviving
         // placeholder is substituted and the dropped closing tag re-appended.
-        let (out, lost) = assemble_reply(reply, &batch, &protected, AcceptPartial::Accept);
+        let (out, lost) = assemble_reply(reply, &batch, &protected, AcceptPartial::Accept, &mut Report::default());
         assert_eq!(out.get(&0).map(String::as_str), Some("Здравей <i></i>"));
         assert!(lost.is_empty());
     }
@@ -765,11 +941,11 @@ mod tests {
         let protected = vec![("Line one\nLine two".to_string(), vec![])];
         let reply = BTreeMap::from([(1, "Един ред".to_string())]);
 
-        let (out, lost) = assemble_reply(reply.clone(), &batch, &protected, AcceptPartial::Reject);
+        let (out, lost) = assemble_reply(reply.clone(), &batch, &protected, AcceptPartial::Reject, &mut Report::default());
         assert!(out.is_empty(), "merged reply must be retried alone");
         assert_eq!(lost, vec![0]);
 
-        let (out, _) = assemble_reply(reply, &batch, &protected, AcceptPartial::Accept);
+        let (out, _) = assemble_reply(reply, &batch, &protected, AcceptPartial::Accept, &mut Report::default());
         assert_eq!(out.get(&0).map(String::as_str), Some("Един ред"));
     }
 
@@ -778,9 +954,122 @@ mod tests {
         let batch = vec![item(4, "Line one\nLine two")];
         let protected = vec![("Line one\nLine two".to_string(), vec![])];
         let reply = BTreeMap::from([(1, "Ред един\nРед два".to_string())]);
-        let (out, lost) = assemble_reply(reply, &batch, &protected, AcceptPartial::Reject);
+        let (out, lost) = assemble_reply(reply, &batch, &protected, AcceptPartial::Reject, &mut Report::default());
         assert_eq!(out.get(&4).map(String::as_str), Some("Ред един\nРед два"));
         assert!(lost.is_empty());
+    }
+
+    #[test]
+    fn extracts_balanced_objects_from_noisy_replies() {
+        // Two objects side by side: the old "first { to last }" slice was
+        // `{"1":"a"},{"2":"b"}` → trailing characters.
+        let map = parse_translations(r#"{"1":"a"} {"2":"b"}"#, 2).unwrap();
+        assert_eq!(map[&1], "a");
+        assert_eq!(map[&2], "b");
+
+        // A closing brace in trailing prose must not extend the slice.
+        let map = parse_translations(r#"{"1":"Здравей"} here is } that"#, 1).unwrap();
+        assert_eq!(map[&1], "Здравей");
+
+        // Braces inside string values are not structural.
+        let map = parse_translations(r#"{"1":"кодът } е } тук"}"#, 1).unwrap();
+        assert_eq!(map[&1], "кодът } е } тук");
+
+        // Prose containing an unbalanced { before the real object.
+        let map = parse_translations("note {oops\n{\"1\":\"да\"}", 1).unwrap();
+        assert_eq!(map[&1], "да");
+    }
+
+    #[test]
+    fn prefers_the_candidate_with_the_most_usable_cues() {
+        // First object is junk, second holds real translations.
+        let reply = r#"{"1":""} {"1":"Здравей","2":"Добър"}"#;
+        let map = parse_translations(reply, 2).unwrap();
+        assert_eq!(map[&1], "Здравей");
+        assert_eq!(map[&2], "Добър");
+    }
+
+    #[test]
+    fn repairs_raw_newlines_inside_json_strings() {
+        // Exactly what the model returned for cue 12 of the Angelyne file:
+        // a raw newline inside the value, and an escaped quote at the start.
+        let broken = "{\n  \"1\": \"\\\"Миссията на\nLA billboard diva Angelyne\",\n  \"2\": \"Angelyne,\nпочистваш ли си?\"\n}";
+        let fixed = escape_control_chars_in_strings(broken);
+        let parsed: Value =
+            serde_json::from_str(&fixed).expect("repair must yield valid JSON");
+        assert_eq!(
+            parsed["1"].as_str().unwrap().lines().count(),
+            2,
+            "line structure survives"
+        );
+        assert!(parsed["1"].as_str().unwrap().starts_with('"'));
+        assert_eq!(parsed["2"].as_str().unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn escape_control_chars_leaves_valid_json_untouched() {
+        let pretty = "{\n  \"1\": \"Здравей\\nсвет\",\n  \"2\": \"текст\"\n}";
+        assert_eq!(escape_control_chars_in_strings(pretty), pretty);
+    }
+
+    #[test]
+    fn escape_control_chars_preserves_escaped_quotes_and_tabs() {
+        let src = "{\"1\": \"рече \\\"здра\\\"\\tтук\\r\\nкрај\"}";
+        assert_eq!(escape_control_chars_in_strings(src), src);
+    }
+
+    #[test]
+    fn escape_control_chars_handles_nul_and_other_controls() {
+        let broken = "{\"1\": \"a\u{0001}b\"}";
+        let fixed = escape_control_chars_in_strings(broken);
+        let parsed: Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(parsed["1"].as_str().unwrap(), "a\u{0001}b");
+    }
+
+    #[test]
+    fn report_counts_line_and_markup_degradations() {
+        let mut report = Report::default();
+        report.push(4, Degradation::Lines { source: 2, result: 1 });
+        report.push(7, Degradation::Markup { tags: "{\\an8}".into() });
+        report.push(9, Degradation::Lines { source: 3, result: 1 });
+
+        assert_eq!(report.line_issues(), vec![4, 9]);
+        assert_eq!(report.markup_issues(), vec![7]);
+        assert_eq!(report.degradations.len(), 3);
+        assert!(Report::default().degradations.is_empty());
+    }
+
+    #[test]
+    fn assemble_reply_records_degradations_for_kept_cues() {
+        // Two-line source answered with one line, in Accept mode.
+        let batch = vec![item(3, "Line one\nLine two")];
+        let protected = vec![("Line one\nLine two".to_string(), vec![])];
+        let reply = BTreeMap::from([(1, "Един ред".to_string())]);
+        let mut report = Report::default();
+
+        let (out, _) =
+            assemble_reply(reply, &batch, &protected, AcceptPartial::Accept, &mut report);
+        assert!(out.contains_key(&3), "cue is still translated");
+        assert_eq!(report.line_issues(), vec![3]);
+        assert_eq!(
+            report.degradations,
+            vec![(3, Degradation::Lines { source: 2, result: 1 })]
+        );
+    }
+
+    #[test]
+    fn assemble_reply_records_nothing_in_reject_mode() {
+        // Rejected cues are retried, not kept — they must not pollute the report.
+        let batch = vec![item(3, "Line one\nLine two")];
+        let protected = vec![("Line one\nLine two".to_string(), vec![])];
+        let reply = BTreeMap::from([(1, "Един ред".to_string())]);
+        let mut report = Report::default();
+
+        let (out, lost) =
+            assemble_reply(reply, &batch, &protected, AcceptPartial::Reject, &mut report);
+        assert!(out.is_empty());
+        assert_eq!(lost, vec![3]);
+        assert!(report.degradations.is_empty());
     }
 
     #[test]
