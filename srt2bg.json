@@ -1,0 +1,12 @@
+{
+  "endpoint": "http://127.0.0.1:8001/v1/chat/completions",
+  "api_key": "",
+  "model": "qwen",
+  "temperature": 0.2,
+  "max_tokens": 2048,
+  "timeout_secs": 180,
+  "retries": 2,
+  "batch_size": 4,
+  "max_batch_chars": 400,
+  "disable_thinking": true
+}

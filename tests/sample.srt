@@ -1,0 +1,32 @@
+1
+00:00:01,000 --> 00:00:03,200
+Hello! How are you today?
+
+2
+00:00:03,500 --> 00:00:06,000
+I'm fine, thanks.
+And you?
+
+3
+00:00:06,500 --> 00:00:09,000
+<i>We need to leave before it gets dark.</i>
+
+4
+00:00:09,300 --> 00:00:12,000
+Wait for me at the corner of the street.
+
+5
+00:00:12,400 --> 00:00:15,000
+{\an8}Don't be late!
+
+6
+00:00:15,500 --> 00:00:18,000
+The meeting starts at half past seven.
+
+7
+00:00:18,500 --> 00:00:21,000
+Did you bring the documents?
+
+8
+00:00:21,500 --> 00:00:24,000
+Of course, they are in my bag.

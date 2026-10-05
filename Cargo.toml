@@ -1,0 +1,10 @@
+[package]
+name = "srt2bg"
+version = "0.0.1"
+edition = "2024"
+description = "Console tool that translates English SRT subtitles to Bulgarian via an OpenAI-compatible LLM endpoint"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
