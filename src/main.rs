@@ -1,28 +1,32 @@
-//! srt2bg — translate English SRT subtitles to Bulgarian via an
+//! srt2lang — translate English SRT subtitles into another language via an
 //! OpenAI-compatible local LLM endpoint.
 
 mod config;
+mod lang;
 mod srt;
 mod translate;
 
 use config::Config;
+use lang::Lang;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use translate::Item;
 
 const USAGE: &str = "\
-srt2bg — translate English SRT subtitles to Bulgarian
+srt2lang — translate English SRT subtitles into another language
 
 USAGE:
-    srt2bg [OPTIONS] <INPUT.srt>
+    srt2lang [OPTIONS] <INPUT.srt>
 
 ARGS:
     <INPUT.srt>            Source subtitle file (UTF-8)
 
 OPTIONS:
-    -o, --output <FILE>    Output file [default: <input>.bg.srt]
-    -c, --config <FILE>    JSON config file [default: ./srt2bg.json, then
-                           ~/.config/srt2bg/config.json]
+    -l, --lang <CODE>      Target language, ISO 639-1 code (fr, bg, ru, …)
+                           [default: from config, then bg]
+    -o, --output <FILE>    Output file [default: <input>.<lang>.srt]
+    -c, --config <FILE>    JSON config file [default: ./srt2lang.json, then
+                           ~/.config/srt2lang/config.json]
     -m, --model <NAME>     Override model from config
     -e, --endpoint <URL>   Override endpoint from config
     -n, --batch-size <N>   Override cues per request from config
@@ -35,7 +39,7 @@ CONFIG (all fields optional):
       \"api_key\": \"\", \"model\": \"gemma-3-4b-it\", \"temperature\": 0.2,
       \"max_tokens\": 2048, \"timeout_secs\": 180, \"retries\": 2,
       \"batch_size\": 8, \"max_batch_chars\": 1500,
-      \"disable_thinking\": true, \"system_prompt\": null }
+      \"disable_thinking\": true, \"lang\": \"bg\", \"system_prompt\": null }
 ";
 
 #[derive(Debug, Default)]
@@ -46,6 +50,7 @@ struct Args {
     model: Option<String>,
     endpoint: Option<String>,
     batch_size: Option<usize>,
+    lang: Option<String>,
     dry_run: bool,
 }
 
@@ -71,6 +76,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<CliAction, Stri
             "-c" | "--config" => out.config = Some(value_for("--config")?),
             "-m" | "--model" => out.model = Some(value_for("--model")?),
             "-e" | "--endpoint" => out.endpoint = Some(value_for("--endpoint")?),
+            "-l" | "--lang" => out.lang = Some(value_for("--lang")?),
             "-n" | "--batch-size" => {
                 let raw = value_for("--batch-size")?;
                 let n: usize = raw
@@ -100,12 +106,14 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<CliAction, Stri
     Ok(CliAction::Run(out))
 }
 
-fn default_output_path(input: &Path) -> PathBuf {
+/// `movie.srt` + `fr` → `movie.fr.srt`. The language keeps the output name
+/// unambiguous once the same source can be translated several ways.
+fn default_output_path(input: &Path, lang: &str) -> PathBuf {
     let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned());
     let dir = input.parent().unwrap_or_else(|| Path::new(""));
     match stem {
-        Some(stem) => dir.join(format!("{stem}.bg.srt")),
-        None => dir.join("output.bg.srt"),
+        Some(stem) => dir.join(format!("{stem}.{lang}.srt")),
+        None => dir.join(format!("output.{lang}.srt")),
     }
 }
 
@@ -122,6 +130,11 @@ fn run(args: Args) -> Result<(), String> {
     if let Some(n) = args.batch_size {
         cfg.batch_size = n;
     }
+    if let Some(code) = args.lang {
+        cfg.lang = code;
+    }
+    // Resolve before any file or network work: a bad code should cost nothing.
+    let target = Lang::resolve(&cfg.lang)?;
 
     let raw = std::fs::read_to_string(&input_path)
         .map_err(|e| format!("cannot read '{}': {e}", input_path.display()))?;
@@ -152,13 +165,15 @@ fn run(args: Args) -> Result<(), String> {
     }
 
     eprintln!(
-        "translating {} cue(s) via {} (model '{}')",
+        "translating {} cue(s) via {} (model '{}', target {} / {})",
         items.len(),
         cfg.endpoint,
-        cfg.model
+        cfg.model,
+        target.code,
+        target.name
     );
 
-    let (translated, report) = translate::translate_items(&cfg, &items);
+    let (translated, report) = translate::translate_items(&cfg, &items, &target);
 
     let mut failed = 0usize;
     for (item, text) in items.iter().zip(&translated) {
@@ -188,7 +203,7 @@ fn run(args: Args) -> Result<(), String> {
 
     let output_path = match args.output {
         Some(p) => PathBuf::from(p),
-        None => default_output_path(&input_path),
+        None => default_output_path(&input_path, &target.code),
     };
     std::fs::write(&output_path, srt::serialize(&parsed))
         .map_err(|e| format!("cannot write '{}': {e}", output_path.display()))?;
@@ -280,7 +295,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(CliAction::Version) => {
-            println!("srt2bg {}", env!("CARGO_PKG_VERSION"));
+            println!("srt2lang {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Ok(CliAction::Run(args)) => match run(args) {
@@ -326,7 +341,8 @@ mod tests {
     fn full_invocation() {
         let CliAction::Run(args) = parse(&[
             "-o", "out.srt", "-c", "cfg.json", "-m", "qwen3", "-e",
-            "http://localhost:9999/v1/chat/completions", "-n", "5", "--dry-run", "in.srt",
+            "http://localhost:9999/v1/chat/completions", "-n", "5", "-l", "fr", "--dry-run",
+            "in.srt",
         ])
         .unwrap() else {
             panic!("expected Run");
@@ -340,6 +356,7 @@ mod tests {
             Some("http://localhost:9999/v1/chat/completions")
         );
         assert_eq!(args.batch_size, Some(5));
+        assert_eq!(args.lang.as_deref(), Some("fr"));
         assert!(args.dry_run);
     }
 
@@ -356,14 +373,18 @@ mod tests {
     }
 
     #[test]
-    fn default_output_name() {
+    fn default_output_name_carries_the_target_language() {
         assert_eq!(
-            default_output_path(Path::new("movie.srt")),
+            default_output_path(Path::new("movie.srt"), "bg"),
             PathBuf::from("movie.bg.srt")
         );
         assert_eq!(
-            default_output_path(Path::new("/tmp/movie.en.srt")),
-            PathBuf::from("/tmp/movie.en.bg.srt")
+            default_output_path(Path::new("/tmp/movie.en.srt"), "fr"),
+            PathBuf::from("/tmp/movie.en.fr.srt")
+        );
+        assert_eq!(
+            default_output_path(Path::new("movie.srt"), "ru"),
+            PathBuf::from("movie.ru.srt")
         );
     }
 }

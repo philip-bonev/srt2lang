@@ -2,11 +2,11 @@
 
 ## Project
 
-`srt2bg` — a Rust console application that translates English SRT subtitle files
-into Bulgarian.
+`srt2lang` — a Rust console application that translates English SRT subtitle files
+into a target language chosen with `-l/--lang` (default `bg`, Bulgarian).
 
 Input: an `.srt` file. Output: the same file with every cue's text translated to
-Bulgarian; timestamps, cue order and cue indices are preserved.
+the target language; timestamps, cue order and cue indices are preserved.
 
 ## Build & test
 
@@ -14,23 +14,61 @@ Rust/cargo live in `~/.cargo/bin` and are **not** on the default `PATH` used by
 non-interactive shells. Prefix every shell command with:
 
 ```sh
-export PATH="/Users/fi4o/.cargo/bin:/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
+export PATH="$HOME/.cargo/bin:/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
 ```
 
 Commands (run from the repo root):
 
 ```sh
-cargo build                 # debug build   -> target/debug/srt2bg
-cargo build -r              # release build -> target/release/srt2bg (optimized; this is the one to benchmark)
+cargo build                 # debug build   -> target/debug/srt2lang
+cargo build -r              # release build -> target/release/srt2lang (optimized; this is the one to benchmark)
 cargo test                  # unit tests (srt parsing, config, batching, response parsing)
-cargo run -- movie.srt      # translate, writes movie.bg.srt
+cargo run -- movie.srt      # translate, writes movie.bg.srt (default lang bg)
+cargo run -- movie.srt -l fr    # ... writes movie.fr.srt
 ```
 
 `-r` is cargo's shorthand for `--release`. Live runs and timing comparisons
-should use `target/release/srt2bg`; the debug binary is several times slower
+should use `target/release/srt2lang`; the debug binary is several times slower
 and would skew any measurement.
 
 Edition: 2024 (rustc 1.99+).
+
+## Target language
+
+`-l, --lang <CODE>` (config `lang`, default `bg`) selects what to translate
+into: `fr`, `ru`, `bg`, `de`, … Three-letter codes (`fra`) work too, case and
+surrounding whitespace are ignored, and an unknown code is a hard error before
+any file or network work. `src/lang.rs` resolves the code through the
+**`iso639` crate**, which supplies both the English name used in the system
+prompt (`French`, not `fr` — a 4B model follows the name far more reliably)
+and the language's ISO 15924 script from CLDR. There is no table of our own to
+keep in sync.
+
+The output name carries the code, so one source can be translated several ways
+without collisions: `movie.srt -l fr` → `movie.fr.srt`.
+
+### Reply validation is script-aware
+
+`looks_untranslated(source, reply, target)` branches on the target's script:
+
+- **Non-Latin target** (Cyrillic, Greek, Arabic, Hebrew, Han, kana, Hangul,
+  Thai, Devanagari) — the reply must contain a character of that script.
+  Precise, and impossible to satisfy with English.
+- **Latin target, or a script CLDR does not cover** — there are no
+  distinctive characters to look for, so it falls back to `echoes_source`: the
+  reply must introduce at least one word the source did not already have.
+  Comparison is over lowercased runs matched with Unicode `is_alphabetic`, not
+  ASCII, so `déjà` and `émission` count as words — an ASCII split would reduce
+  a good French reply to fragments and flag it as untranslated.
+
+**The fallback direction is the important part.** An unknown script must
+degrade to the echo check, never to "not in the target script": a language
+wrongly assumed non-Latin flags *every* correct reply, sending each cue
+through a pointless single-cue retry. That is exactly what a hardcoded
+Cyrillic test did to `fr` before this existed.
+
+Known limit: for Latin targets this catches verbatim and lightly-edited
+echoes, but not an English *paraphrase* — that would need a language detector.
 
 ## Translation backend
 
@@ -142,11 +180,11 @@ does not depend on model obedience:
 1. Batch request; parse the returned JSON object (fences/prose tolerated).
 2. A cue is **rejected** if it is missing from the reply, dropped a
    placeholder, changed its line count (SRT line structure is display
-   structure), or **came back with no Bulgarian** → retried as a single-cue
+   structure), or **came back untranslated** → retried as a single-cue
    request.
 3. The single-cue reply is **accepted** even if imperfect (better a
    translation with a warning than English text), with the markup repair
-   above. If it still has no Bulgarian, `Degradation::Untranslated` is
+   above. If it still reads as the source, `Degradation::Untranslated` is
    recorded so the summary says so.
 4. Still nothing → keep the original English text and report a warning.
 
@@ -155,10 +193,11 @@ does not depend on model obedience:
 Structural checks are not enough: a small model sometimes **echoes its input
 verbatim**, placeholders and all. Such a reply has correct keys, intact
 placeholders and matching line counts — it passes every structural test while
-remaining English. `looks_untranslated` therefore requires Cyrillic in any
-reply to a multi-word Latin-script cue. Sources of fewer than two Latin words
+remaining English. `looks_untranslated` therefore checks the reply against the
+**target language** — see "Target language" above for the script-aware rule and
+why the fallback direction matters. Sources of fewer than two Latin words
 (`- Ooh.`, `- Cory?`, `Angelyne`, `2019`) are exempt: those are correctly left
-in Latin script, and flagging them only buys useless retries.
+alone, and flagging them only buys useless retries.
 
 `translate_items` returns a `Report` alongside the results. It records every
 cue that was accepted *but* imperfect — `Lines`, `Markup`, `Untranslated` —
@@ -238,7 +277,7 @@ is exactly what a value legitimately containing a quote looks like
 (`"He said \"hi\","`). Every rule that would rewrite it can therefore rewrite
 a correct value, and because the rewrite closes the string early the result
 can still parse — with a key or value silently mangled, which passes both the
-line-count and Cyrillic checks. That is the "silently wrong" outcome the
+line-count and language checks. That is the "silently wrong" outcome the
 repairs exist to avoid, so this one is deliberately **not** repaired: the
 `retrying batch (attempt 2)` path recovers it, observed costing one retry.
 
@@ -247,22 +286,24 @@ repairs exist to avoid, so this one is deliberately **not** repaired: the
 JSON config file, discovered in order:
 
 1. `--config <path>` (CLI)
-2. `./srt2bg.json`
-3. `~/.config/srt2bg/config.json`
+2. `./srt2lang.json`
+3. `~/.config/srt2lang/config.json`
 4. built-in defaults
 
 All fields are optional (`#[serde(default)]`); the file only overrides what it
 contains. Fields: `endpoint`, `api_key`, `model`, `temperature`, `max_tokens`,
 `timeout_secs`, `retries`, `batch_size`, `max_batch_chars`, `disable_thinking`,
-`system_prompt`.
+`lang`, `system_prompt`.
 
-CLI overrides exist for the common ones (`--model`, `--endpoint`,
-`--batch-size`); see `--help`.
+CLI overrides exist for the common ones (`--lang`, `--model`, `--endpoint`,
+`--batch-size`); see `--help`. `system_prompt` may contain `{lang}`, which is
+substituted with the target language's English name.
 
 ## Code layout
 
 - `src/main.rs` — CLI parsing, wiring, progress output
 - `src/config.rs` — `Config` struct, JSON loading, defaults
+- `src/lang.rs` — ISO 639 code → name + script (`iso639` crate)
 - `src/srt.rs` — SRT parsing/serialization (pure functions, unit-tested)
 - `src/translate.rs` — batching, prompt building, HTTP call, response parsing
 
@@ -279,7 +320,8 @@ CLI overrides exist for the common ones (`--model`, `--endpoint`,
   small model copies them into output for untagged cues. Describe them
   generically instead.
 - Progress/warnings go to **stderr**; only the translated SRT may go to stdout.
-- Do not commit generated output (`*.bg.srt`) — it is in `.gitignore`.
+- Do not commit generated output (`*.??.srt`, `*.???.srt` — `movie.bg.srt`,
+  `movie.fr.srt`) — it is in `.gitignore`.
 - Batch requests must be resilient: a local server can be busy or restarting
   (`/health` returns 200 when ready).
 - `cargo clippy --all-targets` must stay warning-free; run it after changes.

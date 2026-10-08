@@ -1,9 +1,15 @@
-# srt2bg
+# srt2lang
 
-Translate English SRT subtitle files into Bulgarian with a local LLM.
+Translate English SRT subtitle files into another language with a local LLM.
 
-`movie.srt` → `movie.bg.srt`, with cue indices, timestamps, line structure and
-markup tags (`<i>`, `<b>`, `{\an8}`) preserved exactly.
+```sh
+srt2lang movie.srt -l fr    # movie.srt → movie.fr.srt
+srt2lang movie.srt          # default target: bg → movie.bg.srt
+```
+
+Target language is an ISO 639-1 code (`fr`, `bg`, `ru`, `de`, …). Cue indices,
+timestamps, line structure and markup tags (`<i>`, `<b>`, `{\an8}`) are
+preserved exactly.
 
 Runs entirely offline against any OpenAI-compatible chat completions endpoint —
 by default a local [Lemonade](https://github.com/) / llama-server instance.
@@ -66,6 +72,11 @@ be separated from this data alone. The conservative reading is the right one —
 below 4B the results are bad enough to rule those models out, and 4B is the
 smallest size demonstrated to work.
 
+The table measures **Bulgarian** output specifically. Other targets run the
+identical pipeline, but translation quality per language is a property of the
+model, so spot-check a `fr` or `ru` run rather than assuming these numbers
+carry over.
+
 ---
 
 ## Build
@@ -78,7 +89,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
 ```sh
-cargo build -r          # release build -> target/release/srt2bg
+cargo build -r          # release build -> target/release/srt2lang
 cargo test              # unit tests
 cargo clippy --all-targets
 ```
@@ -89,17 +100,18 @@ slower and will skew any timing.
 ## Usage
 
 ```sh
-./target/release/srt2bg movie.srt                 # writes movie.bg.srt
-./target/release/srt2bg movie.srt -o out.srt      # explicit output path
-./target/release/srt2bg movie.srt --dry-run       # show batches, send nothing
-./target/release/srt2bg --help
+./target/release/srt2lang movie.srt                 # writes movie.bg.srt
+./target/release/srt2lang movie.srt -l fr           # writes movie.fr.srt
+./target/release/srt2lang movie.srt -o out.srt      # explicit output path
+./target/release/srt2lang movie.srt --dry-run       # show batches, send nothing
+./target/release/srt2lang --help
 ```
 
 Progress and warnings go to **stderr**; the translated SRT may be written to
 stdout, so redirect stderr if you want clean logs:
 
 ```sh
-./target/release/srt2bg movie.srt 2>run.log
+./target/release/srt2lang movie.srt 2>run.log
 ```
 
 ## Configuration
@@ -107,8 +119,8 @@ stdout, so redirect stderr if you want clean logs:
 JSON, discovered in this order:
 
 1. `--config <path>`
-2. `./srt2bg.json`
-3. `~/.config/srt2bg/config.json`
+2. `./srt2lang.json`
+3. `~/.config/srt2lang/config.json`
 4. built-in defaults
 
 All fields are optional; the file only overrides what it contains.
@@ -124,12 +136,14 @@ All fields are optional; the file only overrides what it contains.
   "retries": 2,
   "batch_size": 4,
   "max_batch_chars": 400,
-  "disable_thinking": true
+  "disable_thinking": true,
+  "lang": "bg"
 }
 ```
 
 Notes:
 
+- `lang` — target language, ISO 639-1 (`fr`, `bg`, `ru`, …); `-l` overrides it.
 - `endpoint` — any OpenAI-compatible `/v1/chat/completions`.
 - `api_key` — optional; sent as a Bearer token when non-empty.
 - `model` — **not validated** by llama-server, so it documents intent. The
@@ -157,12 +171,15 @@ the model dropped are re-inserted at their original position when that
 position is unambiguous.
 
 **Reply validation.** Structural checks alone are not enough — a reply can be
-perfectly well-formed and entirely untranslated. Any reply to a multi-word
-English cue must contain Cyrillic. Short cues like `- Cory?` or `2019` are
-exempt, since those are correctly left in Latin script.
+perfectly well-formed and entirely untranslated, because small models sometimes
+echo their input back verbatim. For a non-Latin target (`ru`, `bg`, `el`, `ar`,
+`zh`, …) the reply must contain a character of that script. For a Latin target
+(`fr`, `de`, `es`, …) there is no script to check, so instead the reply must
+say something the source did not — an English echo reuses only source words.
+Short cues like `- Cory?` or `2019` are exempt either way.
 
 **Fallback ladder.** A cue is rejected from a batch if it is missing, dropped
-a placeholder, changed line count, or came back without Bulgarian — then
+a placeholder, changed line count, or came back untranslated — then
 retried individually. The individual retry is accepted even if imperfect,
 because a translation with a warning beats English text. Anything still
 untranslated is kept as-is and reported.
@@ -171,7 +188,11 @@ untranslated is kept as-is and reported.
 repaired before or during parsing: raw newlines in strings, naive brace
 extraction, doubled key quotes, illegal escape sequences (rewritten as line
 breaks), and curly quotes used to close a string. Each repair is guarded so
-it only ever runs on a reply that already failed to parse.
+it only ever runs on a reply that already failed to parse. A sixth pattern —
+a backslash before the model's own closing quote — is deliberately *not*
+repaired: it is syntactically identical to a correct escaped quote, so any
+rule that "fixes" it risks parsing with mangled text. The retry ladder
+handles it instead.
 
 ## Quality report
 

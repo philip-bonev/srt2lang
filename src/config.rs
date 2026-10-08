@@ -29,8 +29,11 @@ pub struct Config {
     /// Ask llama.cpp-style servers to skip the reasoning phase
     /// (`chat_template_kwargs.enable_thinking = false`).
     pub disable_thinking: bool,
-    /// Optional replacement for the built-in system prompt.
+    /// Optional replacement for the built-in system prompt. The placeholder
+    /// `{lang}` is substituted with the target language's English name.
     pub system_prompt: Option<String>,
+    /// Target language as an ISO 639-1 (or -3) code: `bg`, `fr`, `ru`, …
+    pub lang: String,
 }
 
 impl Default for Config {
@@ -47,22 +50,23 @@ impl Default for Config {
             max_batch_chars: 1500,
             disable_thinking: true,
             system_prompt: None,
+            lang: "bg".to_string(),
         }
     }
 }
 
 impl Config {
     /// Load configuration from `explicit` when given, otherwise from the first
-    /// existing file among `./srt2bg.json` and `~/.config/srt2bg/config.json`,
+    /// existing file among `./srt2lang.json` and `~/.config/srt2lang/config.json`,
     /// otherwise built-in defaults.
     pub fn load(explicit: Option<&str>) -> Result<Self, String> {
         if let Some(path) = explicit {
             return Self::from_file(path);
         }
 
-        let mut candidates: Vec<PathBuf> = vec![PathBuf::from("srt2bg.json")];
+        let mut candidates: Vec<PathBuf> = vec![PathBuf::from("srt2lang.json")];
         if let Some(home) = std::env::var_os("HOME") {
-            candidates.push(PathBuf::from(home).join(".config/srt2bg/config.json"));
+            candidates.push(PathBuf::from(home).join(".config/srt2lang/config.json"));
         }
 
         for path in candidates {
@@ -114,7 +118,7 @@ mod tests {
 
     #[test]
     fn degenerate_batch_size_is_clamped() {
-        let dir = std::env::temp_dir().join("srt2bg_cfg_test.json");
+        let dir = std::env::temp_dir().join("srt2lang_cfg_test.json");
         std::fs::write(&dir, r#"{"batch_size":0}"#).unwrap();
         let cfg = Config::load(Some(&dir.display().to_string())).unwrap();
         assert_eq!(cfg.batch_size, 1);

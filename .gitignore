@@ -1,8 +1,9 @@
 # Rust / Cargo
 /target
 
-# Generated translations (never commit output)
-*.bg.srt
+# Generated translations (never commit output): movie.bg.srt, movie.fr.srt, …
+*.??.srt
+*.???.srt
 
 # macOS
 .DS_Store

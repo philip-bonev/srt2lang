@@ -2,7 +2,7 @@
 //!
 //! Consecutive cues are grouped into batches and sent as one JSON object
 //! `{"1": "...", "2": "..."}`; the model must answer with the same keys and
-//! Bulgarian values. Keys are always the **1-based position within the
+//! values in the target language. Keys are always the **1-based position within the
 //! batch** — never a file-global index — so request and reply can never drift
 //! apart. Markup tags are replaced by `<tN>` placeholders before the request
 //! and restored afterwards, so preservation does not depend on model
@@ -10,19 +10,21 @@
 //! fail keep their original English text.
 
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::lang::Lang;
 
 /// Instructs the model to return a bare JSON object keyed like the input.
+/// `{lang}` is substituted with the target language's English name.
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a professional subtitle translator. \
 You receive a JSON object whose keys are sequential segment numbers starting at 1 and whose values are English subtitle lines (possibly multi-line, separated by \\n). \
-Translate every value into natural, colloquial Bulgarian suitable for subtitles. \
+Translate every value into natural, colloquial {lang} suitable for subtitles. \
 Rules: keep the tone and register of the original; preserve line count within each value; \
 copy any placeholder tokens standing for markup verbatim; \
 keep proper names, numbers and onomatopoeia; do not renumber the keys; do not add explanations. \
-Respond with ONLY a JSON object with exactly the same keys and the Bulgarian translations as values. \
+Respond with ONLY a JSON object with exactly the same keys and the {lang} translations as values. \
 No markdown, no code fences, no commentary.";
 
 /// One cue ready for translation: its index within the file and its text.
@@ -43,7 +45,8 @@ pub enum Degradation {
     Lines { source: usize, result: usize },
     /// The model dropped markup tags; they were re-inserted by guess.
     Markup { tags: String },
-    /// The model returned no Bulgarian — it echoed English back instead.
+    /// The model returned the source text back instead of a translation —
+    /// an echo, not an answer. See `looks_untranslated`.
     Untranslated,
 }
 
@@ -78,7 +81,8 @@ impl Report {
             .collect()
     }
 
-    /// Cue indices the model answered in English rather than Bulgarian.
+    /// Cue indices the model answered in the source language rather than the
+    /// target one.
     pub fn untranslated_issues(&self) -> Vec<usize> {
         self.degradations
             .iter()
@@ -94,20 +98,55 @@ impl Report {
 /// verbatim. Such a reply passes *every* structural test — keys intact,
 /// placeholders present, line counts matching — so without a language check
 /// it is accepted silently and reported as a success while the cue stays in
-/// English. See `looks_untranslated`.
+/// English.
 ///
 /// Single-word sources are excluded: `- Ooh.`, `- Cory?`, `Angelyne` are
-/// correctly left in Latin script, and flagging them would only buy useless
-/// retries. A multi-word English sentence coming back with zero Cyrillic, on
-/// the other hand, is never a translation.
-fn looks_untranslated(source: &str, reply: &str) -> bool {
-    !has_cyrillic(reply) && latin_words(source) >= 2
+/// correctly left alone, and flagging them would only buy useless retries.
+fn looks_untranslated(source: &str, reply: &str, target: &Lang) -> bool {
+    if latin_words(source) < 2 {
+        return false;
+    }
+    // A non-Latin target is checked against its own script: precise, and
+    // impossible to satisfy with English.
+    match target.reply_in_target_script(reply) {
+        Some(in_script) => !in_script,
+        // Latin (or a script CLDR does not cover) has no characters of its
+        // own to look for, so ask instead whether the reply says anything the
+        // source did not.
+        None => echoes_source(source, reply),
+    }
 }
 
-/// Whether `text` contains any Cyrillic character (U+0400–U+04FF).
-fn has_cyrillic(text: &str) -> bool {
-    text.chars()
-        .any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+/// Whether `reply` introduces no word the source did not already have — i.e.
+/// it is the source, possibly reordered or lightly rephrased, rather than a
+/// translation.
+///
+/// Word comparison rather than string equality, because models echo with
+/// small edits (dropped markup, reflowed punctuation) — and because it is the
+/// only test available for Latin-script targets, where "this reply contains
+/// no Cyrillic" would flag every correct French translation.
+///
+/// A rendering built entirely from words the source also uses is
+/// indistinguishable from an echo without a language detector, so it is
+/// reported rather than silently passed.
+fn echoes_source(source: &str, reply: &str) -> bool {
+    let source_words = content_words(source);
+    content_words(reply)
+        .into_iter()
+        .all(|word| source_words.contains(&word))
+}
+
+/// Lowercased alphabetic runs of two or more characters — content words that
+/// can be compared across languages.
+///
+/// `is_alphabetic` rather than ASCII: splitting on non-ASCII would chop
+/// `déjà` into `d`/`j` and `émission` into `mission`, so a perfectly good
+/// French reply would look like it said nothing new.
+fn content_words(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphabetic())
+        .filter(|w| w.chars().count() >= 2)
+        .map(|w| w.to_lowercase())
+        .collect()
 }
 
 /// Count runs of ASCII letters at least two characters long — i.e. words that
@@ -151,9 +190,13 @@ pub fn build_batches(
 }
 
 /// Translate all items, returning a vector aligned with the input:
-/// `Some(bulgarian)` on success, `None` when every fallback failed
+/// `Some(translated)` on success, `None` when every fallback failed
 /// (caller keeps the original text), plus a report of degraded cues.
-pub fn translate_items(cfg: &Config, items: &[Item]) -> (Vec<Option<String>>, Report) {
+pub fn translate_items(
+    cfg: &Config,
+    items: &[Item],
+    target: &Lang,
+) -> (Vec<Option<String>>, Report) {
     let mut results: Vec<Option<String>> = vec![None; items.len()];
     let mut report = Report::default();
 
@@ -169,7 +212,7 @@ pub fn translate_items(cfg: &Config, items: &[Item]) -> (Vec<Option<String>>, Re
             if batch.len() == 1 { "" } else { "s" }
         );
 
-        match translate_batch(cfg, batch, AcceptPartial::Reject, &mut report) {
+        match translate_batch(cfg, batch, target, AcceptPartial::Reject, &mut report) {
             Ok(map) => {
                 for item in batch {
                     if let Some(text) = map.get(&item.index) {
@@ -188,6 +231,7 @@ pub fn translate_items(cfg: &Config, items: &[Item]) -> (Vec<Option<String>>, Re
             match translate_batch(
                 cfg,
                 std::slice::from_ref(item),
+                target,
                 AcceptPartial::Accept,
                 &mut report,
             ) {
@@ -217,6 +261,7 @@ pub fn translate_items(cfg: &Config, items: &[Item]) -> (Vec<Option<String>>, Re
 fn translate_batch(
     cfg: &Config,
     batch: &[Item],
+    target: &Lang,
     partial: AcceptPartial,
     report: &mut Report,
 ) -> Result<BTreeMap<usize, String>, String> {
@@ -225,7 +270,7 @@ fn translate_batch(
         batch.iter().map(|item| protect_markup(&item.text)).collect();
     let texts: Vec<String> = protected.iter().map(|(t, _)| t.clone()).collect();
 
-    let payload = build_payload(cfg, &texts);
+    let payload = build_payload(cfg, &texts, target);
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -233,11 +278,11 @@ fn translate_batch(
             Ok(content) => match parse_translations(&content, batch.len()) {
                 Ok(positional) => {
                     let (out, lost) =
-                        assemble_reply(positional, batch, &protected, partial, report);
+                        assemble_reply(positional, batch, &protected, target, partial, report);
                     if partial == AcceptPartial::Reject {
                         for index in lost {
                             eprintln!(
-                                "  cue {}: not usable as batch reply (markup/line count/no Bulgarian), retrying alone",
+                                "  cue {}: not usable as batch reply (markup/line count/untranslated), retrying alone",
                                 index + 1
                             );
                         }
@@ -277,6 +322,7 @@ fn assemble_reply(
     positional: BTreeMap<usize, String>,
     batch: &[Item],
     protected: &[(String, Vec<String>)],
+    target: &Lang,
     partial: AcceptPartial,
     report: &mut Report,
 ) -> (BTreeMap<usize, String>, Vec<usize>) {
@@ -294,7 +340,7 @@ fn assemble_reply(
         let source_lines = count_lines(&item.text);
         let result_lines = count_lines(text);
         let merged = source_lines != result_lines;
-        let untranslated = looks_untranslated(&item.text, text);
+        let untranslated = looks_untranslated(&item.text, text, target);
         if (untranslated || !dropped.is_empty() || merged) && partial == AcceptPartial::Reject {
             lost.push(item.index);
             continue;
@@ -302,7 +348,7 @@ fn assemble_reply(
         if untranslated {
             report.push(item.index, Degradation::Untranslated);
             eprintln!(
-                "  cue {}: model answered in English, no Bulgarian in reply",
+                "  cue {}: reply reads as the English source, not a translation",
                 item.index + 1
             );
         }
@@ -368,16 +414,19 @@ fn sleep_backoff(attempt: u32) {
 
 /// Build the chat-completions request body. `texts` are keyed by their
 /// 1-based position in the batch.
-fn build_payload(cfg: &Config, texts: &[String]) -> Value {
+fn build_payload(cfg: &Config, texts: &[String], target: &Lang) -> Value {
     let mut input = Map::new();
     for (pos, text) in texts.iter().enumerate() {
         input.insert((pos + 1).to_string(), Value::String(text.clone()));
     }
 
+    // A custom prompt may use `{lang}` too; substitute there as well so an
+    // override does not silently pin the target language to Bulgarian.
     let system = cfg
         .system_prompt
         .clone()
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string())
+        .replace("{lang}", target.name);
 
     let mut body = json!({
         "model": cfg.model,
@@ -446,8 +495,9 @@ fn post_chat(cfg: &Config, payload: &Value) -> Result<String, String> {
 ///
 /// Two passes. The second straightens curly quotes used as string
 /// delimiters and runs only when the first pass came up short, because that
-/// rewrite also touches Bulgarian quotation marks and must never see a
-/// healthy reply. Entries from the first pass win on conflict.
+/// rewrite also touches quotation marks that are legitimate text in French,
+/// German, Russian and Bulgarian alike, and must never see a healthy reply.
+/// Entries from the first pass win on conflict.
 fn parse_translations(content: &str, expected: usize) -> Result<BTreeMap<usize, String>, String> {
     let stripped = strip_fences(content);
     let mut found = collect_json_objects(stripped, expected);
@@ -568,9 +618,10 @@ fn repair_json(json: &str) -> String {
 
 /// Replace curly double quotes with straight ones.
 ///
-/// Used only as a second pass over an already-failing reply: Bulgarian text
-/// legitimately uses `“ ”` as quotation marks, so rewriting them on a healthy
-/// reply would terminate strings early and corrupt the values.
+/// Used only as a second pass over an already-failing reply: `“ ”` are
+/// legitimate quotation marks in French, German, Russian and Bulgarian alike,
+/// so rewriting them on a healthy reply would terminate strings early and
+/// corrupt the values.
 fn straighten_curly_quotes(text: &str) -> String {
     text.replace(['\u{201C}', '\u{201D}'], "\"")
 }
@@ -917,6 +968,12 @@ mod tests {
         Item { index, text: text.to_string() }
     }
 
+    /// Bulgarian — the default target, and what the Cyrillic fixtures in these
+    /// tests were written against before the target became configurable.
+    fn bg() -> Lang {
+        Lang::resolve("bg").expect("built-in default always resolves")
+    }
+
     #[test]
     fn batches_respect_count_and_char_limits() {
         let items: Vec<Item> = (0..10).map(|i| item(i, &"x".repeat(40))).collect();
@@ -954,7 +1011,7 @@ mod tests {
         let cfg = Config::default();
         // File indices deliberately *not* starting at 0, as in a mid-file batch.
         let texts = vec!["A".to_string(), "B".to_string()];
-        let payload = build_payload(&cfg, &texts);
+        let payload = build_payload(&cfg, &texts, &bg());
         assert_eq!(payload["chat_template_kwargs"]["enable_thinking"], json!(false));
         let user = payload["messages"][1]["content"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(user).unwrap();
@@ -1053,7 +1110,7 @@ mod tests {
         ];
         let reply = BTreeMap::from([(1, "Първи".to_string()), (3, "Трети".to_string())]);
 
-        let (out, lost) = assemble_reply(reply, &batch, &protected, AcceptPartial::Reject, &mut Report::default());
+        let (out, lost) = assemble_reply(reply, &batch, &protected, &bg(), AcceptPartial::Reject, &mut Report::default());
         assert_eq!(out.get(&10).map(String::as_str), Some("Първи"));
         assert_eq!(out.get(&12).map(String::as_str), Some("Трети"));
         assert!(!out.contains_key(&11));
@@ -1067,13 +1124,13 @@ mod tests {
         // Model kept the opening tag but dropped the closing one.
         let reply = BTreeMap::from([(1, "Здравей <t0>".to_string())]);
 
-        let (out, lost) = assemble_reply(reply.clone(), &batch, &protected, AcceptPartial::Reject, &mut Report::default());
+        let (out, lost) = assemble_reply(reply.clone(), &batch, &protected, &bg(), AcceptPartial::Reject, &mut Report::default());
         assert!(out.is_empty(), "batch reply must drop the damaged cue");
         assert_eq!(lost, vec![0]);
 
         // Final single-cue fallback keeps the translation; the surviving
         // placeholder is substituted and the dropped closing tag re-appended.
-        let (out, lost) = assemble_reply(reply, &batch, &protected, AcceptPartial::Accept, &mut Report::default());
+        let (out, lost) = assemble_reply(reply, &batch, &protected, &bg(), AcceptPartial::Accept, &mut Report::default());
         assert_eq!(out.get(&0).map(String::as_str), Some("Здравей <i></i>"));
         assert!(lost.is_empty());
     }
@@ -1121,11 +1178,11 @@ mod tests {
         let protected = vec![("Line one\nLine two".to_string(), vec![])];
         let reply = BTreeMap::from([(1, "Един ред".to_string())]);
 
-        let (out, lost) = assemble_reply(reply.clone(), &batch, &protected, AcceptPartial::Reject, &mut Report::default());
+        let (out, lost) = assemble_reply(reply.clone(), &batch, &protected, &bg(), AcceptPartial::Reject, &mut Report::default());
         assert!(out.is_empty(), "merged reply must be retried alone");
         assert_eq!(lost, vec![0]);
 
-        let (out, _) = assemble_reply(reply, &batch, &protected, AcceptPartial::Accept, &mut Report::default());
+        let (out, _) = assemble_reply(reply, &batch, &protected, &bg(), AcceptPartial::Accept, &mut Report::default());
         assert_eq!(out.get(&0).map(String::as_str), Some("Един ред"));
     }
 
@@ -1134,7 +1191,7 @@ mod tests {
         let batch = vec![item(4, "Line one\nLine two")];
         let protected = vec![("Line one\nLine two".to_string(), vec![])];
         let reply = BTreeMap::from([(1, "Ред един\nРед два".to_string())]);
-        let (out, lost) = assemble_reply(reply, &batch, &protected, AcceptPartial::Reject, &mut Report::default());
+        let (out, lost) = assemble_reply(reply, &batch, &protected, &bg(), AcceptPartial::Reject, &mut Report::default());
         assert_eq!(out.get(&4).map(String::as_str), Some("Ред един\nРед два"));
         assert!(lost.is_empty());
     }
@@ -1229,13 +1286,18 @@ mod tests {
         let map = parse_translations(curly_left, 1).expect("fallback must recover it");
         assert_eq!(map[&1], "Искат\nда интервюират Анжели.");
 
-        // Healthy replies are never rewritten — Bulgarian legitimately uses
-        // “ ” as quotation marks, and straightening them mid-value would
+        // Healthy replies are never rewritten — “ ” are legitimate quotation
+        // marks in the target language, and straightening them mid-value would
         // terminate the string early and corrupt the text.
         let healthy = r#"{"1":"Той каза “не” наистина"}"#;
         assert_eq!(repair_json(healthy), healthy);
         let map = parse_translations(healthy, 1).unwrap();
         assert_eq!(map[&1], "Той каза “не” наистина");
+
+        // Same guard for a Latin-script target: a French reply using the same
+        // quotation marks must come through untouched.
+        let french = r#"{"1":"Il a dit “non” vraiment"}"#;
+        assert_eq!(parse_translations(french, 1).unwrap()[&1], "Il a dit “non” vraiment");
     }
 
     #[test]
@@ -1311,25 +1373,80 @@ mod tests {
         // Verbatim echo of a multi-word sentence: no Cyrillic at all.
         assert!(looks_untranslated(
             "featuring the striking image",
-            "<t0>featuring the striking image<t1>"
+            "<t0>featuring the striking image<t1>",
+            &bg()
         ));
-        assert!(looks_untranslated("what they see.", "what they see."));
+        assert!(looks_untranslated("what they see.", "what they see.", &bg()));
         assert!(looks_untranslated(
             "- I love Angelyne",
-            "- I love Angelyne"
+            "- I love Angelyne",
+            &bg()
         ));
 
         // Correctly left in Latin script — names, numbers, interjections.
-        assert!(!looks_untranslated("- Angelyne.", "- Angelyne."));
-        assert!(!looks_untranslated("Oh.", "Oh."));
-        assert!(!looks_untranslated("2019", "2019"));
-        assert!(!looks_untranslated("Paris", "Пари"));
+        assert!(!looks_untranslated("- Angelyne.", "- Angelyne.", &bg()));
+        assert!(!looks_untranslated("Oh.", "Oh.", &bg()));
+        assert!(!looks_untranslated("2019", "2019", &bg()));
+        assert!(!looks_untranslated("Paris", "Пари", &bg()));
 
         // A real translation always contains Cyrillic.
         assert!(!looks_untranslated(
             "featuring the striking image",
-            "<t0>със striking образ<t1>"
+            "<t0>със striking образ<t1>",
+            &bg()
         ));
+    }
+
+    #[test]
+    fn latin_targets_reject_english_echoes_and_accept_real_translations() {
+        // The case a hardcoded Cyrillic check got wrong: every correct French
+        // reply would have been rejected, sending each cue through a pointless
+        // single-cue retry and reporting good text as untranslated.
+        let fr = Lang::resolve("fr").unwrap();
+
+        assert!(looks_untranslated("I am not a woman.", "I am not a woman.", &fr));
+        // Edited and reordered English still says nothing new.
+        assert!(looks_untranslated("what they see.", "they see what.", &fr));
+        assert!(looks_untranslated(
+            "featuring the striking image",
+            "<t0>featuring the striking image<t1>",
+            &fr
+        ));
+
+        assert!(!looks_untranslated(
+            "I am not a woman.",
+            "Je ne suis pas une femme.",
+            &fr
+        ));
+        // Accented words must count as words, or French looks empty and every
+        // reply falls into the echo bucket.
+        assert!(!looks_untranslated(
+            "It was déjà vu here.",
+            "C'était déjà vu ici.",
+            &fr
+        ));
+        // Short sources stay exempt whatever the target.
+        assert!(!looks_untranslated("- Ooh.", "- Ooh.", &fr));
+        assert!(!looks_untranslated("Angelyne", "Angelyne", &fr));
+    }
+
+    #[test]
+    fn prompt_names_the_target_language() {
+        let cfg = Config::default();
+        let payload = build_payload(&cfg, &["Hi".to_string()], &Lang::resolve("fr").unwrap());
+        let system = payload["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("French"), "{system}");
+        assert!(!system.contains("{lang}"), "placeholder must be substituted");
+        assert!(!system.contains("Bulgarian"), "default must not leak through");
+
+        // A custom prompt gets the same substitution.
+        let custom = Config {
+            system_prompt: Some("Translate to {lang} only.".to_string()),
+            ..Config::default()
+        };
+        let payload = build_payload(&custom, &["Hi".to_string()], &Lang::resolve("ru").unwrap());
+        let system = payload["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(system, "Translate to Russian only.");
     }
 
     #[test]
@@ -1340,9 +1457,21 @@ mod tests {
         assert_eq!(latin_words("Angelyne"), 1);
         assert_eq!(latin_words("2019"), 0);
         assert_eq!(latin_words("<t0>featuring the image<t1>"), 3);
-        assert!(has_cyrillic("Здравей"));
-        assert!(!has_cyrillic("hello"));
-        assert!(!has_cyrillic(""));
+    }
+
+    #[test]
+    fn content_words_are_case_insensitive_and_survive_accents() {
+        let source = content_words("It was déjà vu.");
+        assert!(source.contains("déjà"));
+        assert!(source.contains("vu"));
+        assert!(!source.contains("déjà vu")); // split into separate words
+
+        // Wholly different vocabulary: a translation, not an echo.
+        assert!(!echoes_source("I am not a woman.", "Je ne suis pas une femme."));
+        // Same words, different order: still an echo.
+        assert!(echoes_source("what they see.", "see what they."));
+        // Case and inflection of the *source* words must not save a reply.
+        assert!(echoes_source("What They See.", "what they see."));
     }
 
     #[test]
@@ -1367,7 +1496,7 @@ mod tests {
         let mut report = Report::default();
 
         let (out, _) =
-            assemble_reply(reply, &batch, &protected, AcceptPartial::Accept, &mut report);
+            assemble_reply(reply, &batch, &protected, &bg(), AcceptPartial::Accept, &mut report);
         assert!(out.contains_key(&3), "cue is still translated");
         assert_eq!(report.line_issues(), vec![3]);
         assert_eq!(
@@ -1385,7 +1514,7 @@ mod tests {
         let mut report = Report::default();
 
         let (out, lost) =
-            assemble_reply(reply, &batch, &protected, AcceptPartial::Reject, &mut report);
+            assemble_reply(reply, &batch, &protected, &bg(), AcceptPartial::Reject, &mut report);
         assert!(out.is_empty());
         assert_eq!(lost, vec![3]);
         assert!(report.degradations.is_empty());
@@ -1408,7 +1537,7 @@ mod tests {
         // Batch pass: rejected so the cue is retried on its own.
         let mut report = Report::default();
         let (out, lost) =
-            assemble_reply(reply.clone(), &batch, &protected, AcceptPartial::Reject, &mut report);
+            assemble_reply(reply.clone(), &batch, &protected, &bg(), AcceptPartial::Reject, &mut report);
         assert!(out.is_empty(), "echoed English must not be accepted");
         assert_eq!(lost, vec![3], "cue is queued for a single retry");
         assert!(report.degradations.is_empty(), "rejections are not reported");
@@ -1417,7 +1546,7 @@ mod tests {
         // record that it is English, so the summary is honest about it.
         let mut report = Report::default();
         let (out, lost) =
-            assemble_reply(reply, &batch, &protected, AcceptPartial::Accept, &mut report);
+            assemble_reply(reply, &batch, &protected, &bg(), AcceptPartial::Accept, &mut report);
         assert!(out.contains_key(&3), "kept rather than dropped");
         assert!(lost.is_empty(), "Accept mode never drops a cue");
         assert_eq!(report.untranslated_issues(), vec![3]);
@@ -1438,7 +1567,7 @@ mod tests {
 
         let mut report = Report::default();
         let (out, _lost) =
-            assemble_reply(reply, &batch, &protected, AcceptPartial::Reject, &mut report);
+            assemble_reply(reply, &batch, &protected, &bg(), AcceptPartial::Reject, &mut report);
         assert!(out.contains_key(&3));
         assert!(report.degradations.is_empty());
     }
@@ -1455,12 +1584,12 @@ mod tests {
     fn payload_disables_thinking_and_carries_values() {
         let cfg = Config::default();
         assert!(cfg.disable_thinking);
-        let payload = build_payload(&cfg, &["Hi".to_string()]);
+        let payload = build_payload(&cfg, &["Hi".to_string()], &bg());
         assert_eq!(payload["model"], json!(cfg.model));
 
         let mut no_think = cfg.clone();
         no_think.disable_thinking = false;
-        let payload = build_payload(&no_think, &["Hi".to_string()]);
+        let payload = build_payload(&no_think, &["Hi".to_string()], &bg());
         assert!(payload.get("chat_template_kwargs").is_none());
     }
 }

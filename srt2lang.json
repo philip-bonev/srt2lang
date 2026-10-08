@@ -8,5 +8,6 @@
   "retries": 2,
   "batch_size": 4,
   "max_batch_chars": 400,
-  "disable_thinking": true
+  "disable_thinking": true,
+  "lang": "bg"
 }
