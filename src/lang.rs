@@ -35,7 +35,9 @@ impl Lang {
         }
 
         let record = autonym::get(&tag).ok_or_else(|| {
-            format!("unknown language code '{tag}' — pass an ISO 639-1 code such as 'fr', 'bg' or 'ru'")
+            format!(
+                "unknown language code '{tag}' — pass an ISO 639-1 code such as 'fr', 'bg' or 'ru'"
+            )
         })?;
 
         // Some languages are only listed under their 3-letter code in the
@@ -80,8 +82,11 @@ impl Lang {
 }
 
 fn in_ranges(text: &str, ranges: &[(u32, u32)]) -> bool {
-    text.chars()
-        .any(|c| ranges.iter().any(|&(lo, hi)| (c as u32) >= lo && (c as u32) <= hi))
+    text.chars().any(|c| {
+        ranges
+            .iter()
+            .any(|&(lo, hi)| (c as u32) >= lo && (c as u32) <= hi)
+    })
 }
 
 const CYRILLIC: &[(u32, u32)] = &[(0x0400, 0x04FF), (0x0500, 0x052F)];
@@ -153,8 +158,18 @@ mod tests {
         // French is Latin-script: there is nothing distinctive to look for, so
         // callers must fall back to echo detection instead of flagging every
         // correct reply — which is exactly what a hardcoded Cyrillic test did.
-        assert_eq!(Lang::resolve("fr").unwrap().reply_in_target_script("Bonjour!"), None);
-        assert_eq!(Lang::resolve("de").unwrap().reply_in_target_script("Hallo!"), None);
+        assert_eq!(
+            Lang::resolve("fr")
+                .unwrap()
+                .reply_in_target_script("Bonjour!"),
+            None
+        );
+        assert_eq!(
+            Lang::resolve("de")
+                .unwrap()
+                .reply_in_target_script("Hallo!"),
+            None
+        );
     }
 
     #[test]

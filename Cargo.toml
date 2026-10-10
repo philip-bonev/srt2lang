@@ -2,6 +2,7 @@
 name = "srt2lang"
 version = "1.1.0"
 edition = "2024"
+rust-version = "1.99"
 description = "Console tool that translates English SRT subtitles into another language via an OpenAI-compatible LLM endpoint"
 
 [dependencies]

@@ -39,9 +39,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            endpoint: "http://127.0.0.1:8001/v1/chat/completions".to_string(),
+            endpoint: "http://192.168.1.2:13305/v1/chat/completions".to_string(),
             api_key: String::new(),
-            model: "gemma-3-4b-it".to_string(),
+            model: "gemma-4-E2B-it-qat-q4_0-gguf-Q4_0".to_string(),
             temperature: 0.2,
             max_tokens: 2048,
             timeout_secs: 180,
@@ -80,8 +80,8 @@ impl Config {
     }
 
     fn from_file(path: &str) -> Result<Self, String> {
-        let raw = fs::read_to_string(path)
-            .map_err(|e| format!("cannot read config '{path}': {e}"))?;
+        let raw =
+            fs::read_to_string(path).map_err(|e| format!("cannot read config '{path}': {e}"))?;
         let mut cfg: Self = serde_json::from_str(&raw)
             .map_err(|e| format!("invalid JSON in config '{path}': {e}"))?;
 
@@ -118,10 +118,17 @@ mod tests {
 
     #[test]
     fn degenerate_batch_size_is_clamped() {
-        let dir = std::env::temp_dir().join("srt2lang_cfg_test.json");
-        std::fs::write(&dir, r#"{"batch_size":0}"#).unwrap();
-        let cfg = Config::load(Some(&dir.display().to_string())).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "srt2lang_cfg_test_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, r#"{"batch_size":0}"#).unwrap();
+        let cfg = Config::load(Some(&path.display().to_string())).unwrap();
         assert_eq!(cfg.batch_size, 1);
-        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(&path);
     }
 }

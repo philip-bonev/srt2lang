@@ -8,6 +8,8 @@ mod translate;
 
 use config::Config;
 use lang::Lang;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use translate::Item;
@@ -66,7 +68,8 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<CliAction, Stri
 
     while let Some(arg) = args.next() {
         let mut value_for = |flag: &str| {
-            args.next().ok_or_else(|| format!("{flag} requires a value"))
+            args.next()
+                .ok_or_else(|| format!("{flag} requires a value"))
         };
 
         match arg.as_str() {
@@ -146,11 +149,21 @@ fn run(args: Args) -> Result<(), String> {
             parsed.skipped
         );
     }
-    eprintln!("parsed {} cue(s) from {}", parsed.cues.len(), input_path.display());
+    eprintln!(
+        "parsed {} cue(s) from {}",
+        parsed.cues.len(),
+        input_path.display()
+    );
 
     if args.dry_run {
         return Ok(());
     }
+
+    let output_path = match args.output {
+        Some(p) => PathBuf::from(p),
+        None => default_output_path(&input_path, &target.code),
+    };
+    ensure_distinct_paths(&input_path, &output_path)?;
 
     // Collect the text to translate, remembering which lines belong to which cue.
     let mut items: Vec<Item> = Vec::new();
@@ -178,7 +191,9 @@ fn run(args: Args) -> Result<(), String> {
     let mut failed = 0usize;
     for (item, text) in items.iter().zip(&translated) {
         match text {
-            Some(text) => parsed.cues[item.index].text = text.split('\n').map(str::to_string).collect(),
+            Some(text) => {
+                parsed.cues[item.index].text = text.split('\n').map(str::to_string).collect()
+            }
             None => {
                 failed += 1;
                 eprintln!("warning: cue {} left in English", item.index + 1);
@@ -201,17 +216,16 @@ fn run(args: Args) -> Result<(), String> {
     let markup_issues = cue_numbers(report.markup_issues());
     let english_issues = cue_numbers(report.untranslated_issues());
 
-    let output_path = match args.output {
-        Some(p) => PathBuf::from(p),
-        None => default_output_path(&input_path, &target.code),
-    };
-    std::fs::write(&output_path, srt::serialize(&parsed))
-        .map_err(|e| format!("cannot write '{}': {e}", output_path.display()))?;
+    write_output(&output_path, &srt::serialize(&parsed))?;
 
     // Quality summary: failures alone understate the picture, since a cue can
     // be "translated" yet still differ from what was asked for.
     eprintln!("--- quality ---");
-    eprintln!("  translated          : {}", items.len() - failed);
+    let translated_count = items
+        .len()
+        .saturating_sub(failed)
+        .saturating_sub(english_issues.len());
+    eprintln!("  translated          : {translated_count}");
     if !unchanged.is_empty() {
         eprintln!(
             "  unchanged (no-op)   : {}  -> {}",
@@ -263,6 +277,92 @@ fn run(args: Args) -> Result<(), String> {
         }
     );
     Ok(())
+}
+
+/// Refuse to overwrite the input, including through relative-path aliases and
+/// symlinks. Translation output should never be the only copy of the source.
+fn ensure_distinct_paths(input: &Path, output: &Path) -> Result<(), String> {
+    let input = fs::canonicalize(input)
+        .map_err(|e| format!("cannot resolve input '{}': {e}", input.display()))?;
+    let output = canonical_output_path(output)?;
+    if input == output {
+        return Err(format!(
+            "output '{}' is the input file; choose a different output path",
+            output.display()
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_output_path(output: &Path) -> Result<PathBuf, String> {
+    if output.exists() {
+        return fs::canonicalize(output)
+            .map_err(|e| format!("cannot resolve output '{}': {e}", output.display()));
+    }
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).map_err(|e| {
+        format!(
+            "cannot resolve output directory '{}': {e}",
+            parent.display()
+        )
+    })?;
+    let name = output
+        .file_name()
+        .ok_or_else(|| format!("output '{}' has no file name", output.display()))?;
+    Ok(parent.join(name))
+}
+
+/// Replace the destination only after its complete contents were written and
+/// synced to a new file in the same directory. Same-directory rename is atomic
+/// on the supported local filesystems, so existing outputs stay intact on error.
+fn write_output(output: &Path, contents: &str) -> Result<(), String> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = output
+        .file_name()
+        .ok_or_else(|| format!("output '{}' has no file name", output.display()))?
+        .to_string_lossy();
+
+    for suffix in 0..100 {
+        let temporary = parent.join(format!(
+            ".{name}.srt2lang-{}-{suffix}.tmp",
+            std::process::id()
+        ));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot create temporary output '{}': {error}",
+                    temporary.display()
+                ));
+            }
+        };
+
+        let result = file
+            .write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::rename(&temporary, output));
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("cannot write '{}': {error}", output.display()));
+        }
+        return Ok(());
+    }
+
+    Err(format!(
+        "cannot create a unique temporary output next to '{}'",
+        output.display()
+    ))
 }
 
 /// Convert 0-based file positions (as `Report` stores them) into the 1-based
@@ -340,8 +440,19 @@ mod tests {
     #[test]
     fn full_invocation() {
         let CliAction::Run(args) = parse(&[
-            "-o", "out.srt", "-c", "cfg.json", "-m", "qwen3", "-e",
-            "http://localhost:9999/v1/chat/completions", "-n", "5", "-l", "fr", "--dry-run",
+            "-o",
+            "out.srt",
+            "-c",
+            "cfg.json",
+            "-m",
+            "qwen3",
+            "-e",
+            "http://localhost:9999/v1/chat/completions",
+            "-n",
+            "5",
+            "-l",
+            "fr",
+            "--dry-run",
             "in.srt",
         ])
         .unwrap() else {
@@ -386,5 +497,29 @@ mod tests {
             default_output_path(Path::new("movie.srt"), "ru"),
             PathBuf::from("movie.ru.srt")
         );
+    }
+
+    #[test]
+    fn output_cannot_replace_input_and_is_written_atomically() {
+        let root = std::env::temp_dir().join(format!(
+            "srt2lang_main_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let input = root.join("source.srt");
+        let output = root.join("output.srt");
+        std::fs::write(&input, "source").unwrap();
+        std::fs::write(&output, "old output").unwrap();
+
+        assert!(ensure_distinct_paths(&input, &root.join("./source.srt")).is_err());
+        ensure_distinct_paths(&input, &output).unwrap();
+        write_output(&output, "new output").unwrap();
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "new output");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

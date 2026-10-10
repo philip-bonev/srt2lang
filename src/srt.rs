@@ -58,17 +58,17 @@ pub fn parse(input: &str) -> Result<Srt, String> {
     let mut next_index = 1usize;
 
     let flush = |block: &mut Vec<&str>,
-                     cues: &mut Vec<Cue>,
-                     skipped: &mut usize,
-                     next_index: &mut usize| {
+                 cues: &mut Vec<Cue>,
+                 skipped: &mut usize,
+                 next_index: &mut usize| {
         if block.iter().all(|l| l.trim().is_empty()) {
             block.clear();
             return;
         }
-        // Locate the timing line: either first or second line of the block.
+        // Locate a valid timing line: either first or second line of the block.
         let timing_pos = block
             .iter()
-            .position(|l| l.contains("-->"))
+            .position(|l| is_timing_line(l))
             .filter(|&p| p <= 1);
         let Some(timing_pos) = timing_pos else {
             *skipped += 1;
@@ -79,14 +79,22 @@ pub fn parse(input: &str) -> Result<Srt, String> {
             *next_index += 1;
             (*next_index - 1).to_string()
         } else {
-            block[0].to_string()
+            let index = block[0].to_string();
+            if let Ok(explicit) = index.trim().parse::<usize>() {
+                *next_index = explicit.saturating_add(1);
+            }
+            index
         };
         let timing = block[timing_pos].to_string();
         let text: Vec<String> = block[timing_pos + 1..]
             .iter()
             .map(|l| (*l).to_string())
             .collect();
-        cues.push(Cue { index, timing, text });
+        cues.push(Cue {
+            index,
+            timing,
+            text,
+        });
         block.clear();
     };
 
@@ -100,7 +108,7 @@ pub fn parse(input: &str) -> Result<Srt, String> {
     }
     flush(&mut block, &mut cues, &mut skipped, &mut next_index);
 
-    if cues.is_empty() && skipped == 0 {
+    if cues.is_empty() {
         return Err("no subtitle cues found (file is empty or not an SRT)".to_string());
     }
 
@@ -109,6 +117,28 @@ pub fn parse(input: &str) -> Result<Srt, String> {
         newline,
         skipped,
     })
+}
+
+/// Accept SRT timing lines only. A literal `-->` in dialogue must not turn a
+/// malformed block into a cue.
+fn is_timing_line(line: &str) -> bool {
+    let Some((start, rest)) = line.split_once("-->") else {
+        return false;
+    };
+    let end = rest.split_whitespace().next().unwrap_or_default();
+    is_timestamp(start.trim()) && is_timestamp(end)
+}
+
+fn is_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 12
+        && bytes[2] == b':'
+        && bytes[5] == b':'
+        && bytes[8] == b','
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, byte)| matches!(i, 2 | 5 | 8) || byte.is_ascii_digit())
 }
 
 /// Serialize cues back to SRT text using the file's original line endings.
@@ -157,7 +187,10 @@ mod tests {
         let out = serialize(&srt);
         assert!(!out.contains('\u{feff}'), "BOM must not be re-emitted");
         assert!(out.contains("\r\n"));
-        assert!(!out.replace("\r\n", "").contains('\n'), "mixed endings not allowed");
+        assert!(
+            !out.replace("\r\n", "").contains('\n'),
+            "mixed endings not allowed"
+        );
     }
 
     #[test]
@@ -165,7 +198,10 @@ mod tests {
         let src = "7\n01:02:03,004 --> 01:02:04,005\n<i>Render this</i>\n{\\an8}Top line\n\n";
         let srt = parse(src).unwrap();
         assert_eq!(srt.cues[0].timing, "01:02:03,004 --> 01:02:04,005");
-        assert_eq!(srt.cues[0].text, vec!["<i>Render this</i>", "{\\an8}Top line"]);
+        assert_eq!(
+            srt.cues[0].text,
+            vec!["<i>Render this</i>", "{\\an8}Top line"]
+        );
         assert_eq!(serialize(&srt), src);
     }
 
@@ -190,6 +226,18 @@ mod tests {
     fn rejects_empty_input() {
         assert!(parse("").is_err());
         assert!(parse("\n\n").is_err());
+        assert!(parse("garbage without timing\n\n").is_err());
+        assert!(parse("1\na --> b\ntext\n\n").is_err());
+    }
+
+    #[test]
+    fn rejects_non_timing_arrows_and_advances_synthetic_indices() {
+        let src =
+            "9\n00:00:01,000 --> 00:00:02,000\nFirst\n\n00:00:03,000 --> 00:00:04,000\nSecond\n\n";
+        let srt = parse(src).unwrap();
+        assert_eq!(srt.cues[0].index, "9");
+        assert_eq!(srt.cues[1].index, "10");
+        assert!(!is_timing_line("dialogue --> more dialogue"));
     }
 
     #[test]
