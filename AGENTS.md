@@ -180,13 +180,39 @@ does not depend on model obedience:
 1. Batch request; parse the returned JSON object (fences/prose tolerated).
 2. A cue is **rejected** if it is missing from the reply, dropped a
    placeholder, changed its line count (SRT line structure is display
-   structure), or **came back untranslated** → retried as a single-cue
-   request.
+   structure), **came back untranslated**, or **lost a number** that was in
+   the source → retried as a single-cue request.
 3. The single-cue reply is **accepted** even if imperfect (better a
    translation with a warning than English text), with the markup repair
-   above. If it still reads as the source, `Degradation::Untranslated` is
-   recorded so the summary says so.
+   above, plus the two structural repairs below. If it still reads as the
+   source, `Degradation::Untranslated` is recorded so the summary says so.
 4. Still nothing → keep the original English text and report a warning.
+
+### Structural repairs on an accepted reply
+
+Two failures are worth *repairing* rather than just reporting, because both
+leave a file that is structurally wrong even though the wording is fine.
+
+- **Merged lines.** A source cue broken over two or three lines that comes
+  back as one long line overflows the screen. `rewrap_lines` re-splits the
+  translation into the source's line count at whitespace, so no tag or
+  placeholder is ever cut in half. Recorded as `Degradation::Rewrapped`.
+  Measured on `sample.movie.srt`: this took the file from **70 merged cues to
+  0**, with timestamps and cue count untouched. If the text cannot be split
+  that many ways it is left merged and reported as `Degradation::Lines`.
+- **Dropped numbers.** `Not 10.1. Not 10.2. Mach 10.` answered with a
+  sentence that never mentions 10.1 or 10.2 has lost its meaning, not just
+  its style. `missing_numbers` compares normalised numeric tokens — `5,000`
+  and `5000` are the same number, as are `7.5` and `7,5` — so only genuine
+  drops are flagged. Recorded as `Degradation::Numbers`.
+
+`normalize_model_text` also strips trailing newlines before validation. A
+terminator is not a subtitle line: counting it let a merged reply pass the
+line-count check and serialize as text plus a blank line, which showed up in
+the movie sample as a cue with an invisible extra line. On the raw movie run
+that check flagged 11 cues, of which 9 were formatting differences that
+normalisation correctly ignores and 2 were real content errors.
+
 
 ### Reply validation
 
@@ -200,11 +226,17 @@ why the fallback direction matters. Sources of fewer than two Latin words
 alone, and flagging them only buys useless retries.
 
 `translate_items` returns a `Report` alongside the results. It records every
-cue that was accepted *but* imperfect — `Lines`, `Markup`, `Untranslated` —
-because a run's failures alone understate the picture: most degraded cues are
-accepted, not rejected. `main.rs` prints these as a `--- quality ---` summary.
-Rejections are deliberately *not* recorded; they are retried, so counting them
-would double-count the eventual outcome.
+cue that was accepted *but* imperfect — `Lines`, `Rewrapped`, `Markup`,
+`Numbers`, `Untranslated` — because a run's failures alone understate the
+picture: most degraded cues are accepted, not rejected. `main.rs` prints these
+as a `--- quality ---` summary. Rejections are deliberately *not* recorded;
+they are retried, so counting them would double-count the eventual outcome.
+
+The headline `translated` count in that summary is `items` minus the cues that
+did not actually become a translation: ones with no surviving reply, ones the
+model echoed back, and byte-identical no-ops (`Mach 10!`, `2019`). Without
+subtracting the no-ops the count is inflated — they are correct output, but
+they are not translations.
 
 `Report` keys entries by **0-based file position**, matching `Item::index`.
 SRT cues are numbered from 1, so anything user-facing must go through

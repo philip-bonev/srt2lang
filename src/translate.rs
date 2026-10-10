@@ -45,11 +45,17 @@ pub struct Item {
 /// summarised rather than left as scattered stderr lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Degradation {
-    /// The model returned fewer (or more) lines than the source cue had.
+    /// The model returned fewer (or more) lines than the source cue had, and
+    /// the breaks could not be rebalanced automatically.
     Lines { source: usize, result: usize },
+    /// The model collapsed several source lines into fewer; the line breaks
+    /// were rebalanced to match the source layout again.
+    Rewrapped { lines: usize },
     /// The model dropped or duplicated markup placeholders; tags were repaired
     /// where their original position was unambiguous.
     Markup { tags: String },
+    /// The model dropped a number that appeared in the source cue.
+    Numbers { missing: String },
     /// The model returned the source text back instead of a translation —
     /// an echo, not an answer. See `looks_untranslated`.
     Untranslated,
@@ -73,6 +79,24 @@ impl Report {
         self.degradations
             .iter()
             .filter(|(_, d)| matches!(d, Degradation::Lines { .. }))
+            .map(|(i, _)| *i)
+            .collect()
+    }
+
+    /// Cue indices whose line breaks had to be rebalanced after a merge.
+    pub fn rewrapped_issues(&self) -> Vec<usize> {
+        self.degradations
+            .iter()
+            .filter(|(_, d)| matches!(d, Degradation::Rewrapped { .. }))
+            .map(|(i, _)| *i)
+            .collect()
+    }
+
+    /// Cue indices that came back missing a number present in the source.
+    pub fn number_issues(&self) -> Vec<usize> {
+        self.degradations
+            .iter()
+            .filter(|(_, d)| matches!(d, Degradation::Numbers { .. }))
             .map(|(i, _)| *i)
             .collect()
     }
@@ -361,7 +385,8 @@ fn assemble_reply(
         let result_lines = count_lines(&text);
         let merged = source_lines != result_lines;
         let untranslated = looks_untranslated(&item.text, &text, target);
-        if (untranslated || !malformed_tags.is_empty() || merged)
+        let dropped_numbers = missing_numbers(&item.text, &text);
+        if (untranslated || !malformed_tags.is_empty() || merged || !dropped_numbers.is_empty())
             && partial == AcceptPartial::Reject
         {
             lost.push(item.index);
@@ -406,7 +431,44 @@ fn assemble_reply(
             out.insert(item.index, restored);
             continue;
         }
-        if merged {
+        // A merge is a display-layout failure, not a wording one: the source
+        // was broken over `source_lines` for a reason. Rebalance the breaks
+        // when the text allows it, and only report true drift when it does not.
+        let text = if merged && result_lines < source_lines {
+            match rewrap_lines(&text, source_lines) {
+                Some(rewrapped) => {
+                    report.push(
+                        item.index,
+                        Degradation::Rewrapped {
+                            lines: source_lines,
+                        },
+                    );
+                    eprintln!(
+                        "  cue {}: model merged {} line(s) into {}; rebalanced line breaks",
+                        item.index + 1,
+                        source_lines,
+                        result_lines
+                    );
+                    rewrapped
+                }
+                None => {
+                    report.push(
+                        item.index,
+                        Degradation::Lines {
+                            source: source_lines,
+                            result: result_lines,
+                        },
+                    );
+                    eprintln!(
+                        "  cue {}: model merged {} line(s) into {}, could not rebalance",
+                        item.index + 1,
+                        source_lines,
+                        result_lines
+                    );
+                    text
+                }
+            }
+        } else if merged {
             report.push(
                 item.index,
                 Degradation::Lines {
@@ -415,10 +477,26 @@ fn assemble_reply(
                 },
             );
             eprintln!(
-                "  cue {}: model merged {} line(s) into {}, keeping translation",
+                "  cue {}: model split {} line(s) into {}, keeping translation",
                 item.index + 1,
                 source_lines,
                 result_lines
+            );
+            text
+        } else {
+            text
+        };
+        if !dropped_numbers.is_empty() {
+            report.push(
+                item.index,
+                Degradation::Numbers {
+                    missing: dropped_numbers.join(", "),
+                },
+            );
+            eprintln!(
+                "  cue {}: model dropped number(s) {} from the source",
+                item.index + 1,
+                dropped_numbers.join(", ")
             );
         }
         out.insert(item.index, restore_markup(&text, source, tags).0);
@@ -845,14 +923,161 @@ fn is_supported_html_tag(tag: &[char]) -> bool {
 }
 
 /// Normalize model text to the internal LF representation before validation or
-/// serialization. A trailing newline is a real extra subtitle line.
+/// serialization.
+///
+/// Trailing newlines are stripped: a model that answers a two-line cue with
+/// `text\n` is merging the two lines and adding a terminator, not asking for a
+/// blank subtitle line. Counting that terminator as a second line would let a
+/// merged translation pass the line-count check and then serialize as text
+/// followed by an empty line — a silent layout corruption that looks like a
+/// successful translation.
 fn normalize_model_text(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim_end_matches('\n')
+        .to_string()
 }
 
 /// Number of text lines, including a trailing empty line.
 fn count_lines(text: &str) -> usize {
     text.split('\n').count()
+}
+
+/// Rebalance `text` into exactly `target_lines` lines of near-equal length.
+///
+/// Subtitle line breaks are a display constraint: a two-line cue that comes
+/// back as one long line overflows the screen even though the wording is
+/// fine. Since the source already decided how many lines the cue needs, the
+/// cheapest structural repair is to re-split the translation the same way.
+///
+/// Cuts are made only at whitespace, so a tag or placeholder can never be
+/// sliced in half. Returns `None` when the text cannot be broken into that
+/// many non-empty lines, leaving the merge for the caller to report.
+fn rewrap_lines(text: &str, target_lines: usize) -> Option<String> {
+    if target_lines < 2 {
+        return None;
+    }
+    let flat = text
+        .split('\n')
+        .flat_map(|line| line.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+
+    let chars: Vec<char> = flat.chars().collect();
+    let pending_chars = |from: usize| chars[from..].iter().filter(|c| !c.is_whitespace()).count();
+    if pending_chars(0) < target_lines {
+        return None;
+    }
+
+    let mut lines = Vec::with_capacity(target_lines);
+    let mut start = 0usize;
+    for remaining in (1..=target_lines).rev() {
+        let end = if remaining == 1 {
+            chars.len()
+        } else {
+            let ideal = start + pending_chars(start) / remaining;
+            (start..chars.len())
+                .filter(|&i| chars[i].is_whitespace())
+                .filter(|&i| {
+                    chars[start..i].iter().any(|c| !c.is_whitespace())
+                        && chars[i + 1..].iter().any(|c| !c.is_whitespace())
+                })
+                .min_by_key(|&i| i.abs_diff(ideal))?
+        };
+        let line: String = chars[start..end].iter().collect();
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            return None;
+        }
+        lines.push(line);
+        start = end;
+        while start < chars.len() && chars[start].is_whitespace() {
+            start += 1;
+        }
+    }
+    if lines.len() != target_lines {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
+/// Numbers present in `source` that the reply does not mention.
+///
+/// Formatting is normalised away first — `5,000` and `5000` are the same
+/// number, as are `7.5` and `7,5` (decimal comma) — so only genuinely dropped
+/// numbers are flagged. That matters for content, not style: a cue reading
+/// `Not 10.1. Not 10.2. Mach 10.` answered with a sentence that never mentions
+/// 10.1 or 10.2 has lost its meaning, and is worth a retry.
+fn missing_numbers(source: &str, reply: &str) -> Vec<String> {
+    let source_numbers = numeric_tokens(source);
+    if source_numbers.is_empty() {
+        return Vec::new();
+    }
+    let reply_numbers = numeric_tokens(reply);
+    let mut missing: Vec<String> = source_numbers
+        .into_iter()
+        .filter(|number| !reply_numbers.contains(number))
+        .collect();
+    missing.sort();
+    missing
+}
+
+/// Normalised numeric tokens in `text`, ignoring markup and placeholders so a
+/// `{\\an8}` override or a `<t0>` token is never mistaken for a number.
+fn numeric_tokens(text: &str) -> HashSet<String> {
+    let (protected, _) = protect_markup(text);
+    let text = strip_placeholder_residue(&protected);
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = HashSet::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == ',') {
+            i += 1;
+        }
+        // `8,000... 7,000` is two numbers separated by an ellipsis, not one
+        // token with trailing separators.
+        let mut end = i;
+        while end > start && (chars[end - 1] == '.' || chars[end - 1] == ',') {
+            end -= 1;
+        }
+        let raw: String = chars[start..end].iter().collect();
+        if let Some(number) = normalize_number(&raw) {
+            out.insert(number);
+        }
+    }
+    out
+}
+
+/// Canonicalise one numeric literal: drop thousands separators, unify the
+/// decimal separator. Returns `None` for runs that are not a single number.
+fn normalize_number(raw: &str) -> Option<String> {
+    let groups: Vec<&str> = raw.split(['.', ',']).collect();
+    if groups.iter().any(|group| group.is_empty()) {
+        return None;
+    }
+    let last_len = groups.last()?.chars().count();
+    // `8,000` / `1.234.567` are grouped thousands; `7.5` / `10.1` are decimals.
+    let grouped = groups.len() > 1
+        && last_len == 3
+        && groups[..groups.len() - 1]
+            .iter()
+            .all(|group| (1..=3).contains(&group.chars().count()));
+    if grouped {
+        return Some(groups.concat());
+    }
+    match groups.len() {
+        1 => Some(groups[0].to_string()),
+        _ => Some(format!("{}.{}", groups[0], groups[1])),
+    }
 }
 
 /// Tags whose `<tN>` placeholder was dropped or duplicated by the model.
@@ -1413,7 +1638,65 @@ mod tests {
             AcceptPartial::Accept,
             &mut Report::default(),
         );
-        assert_eq!(out.get(&0).map(String::as_str), Some("Един ред"));
+        assert_eq!(out.get(&0).map(String::as_str), Some("Един\nред"));
+    }
+
+    #[test]
+    fn rewrap_lines_balances_at_whitespace_and_refuses_unsplittable_text() {
+        assert_eq!(
+            rewrap_lines("One two three four", 2),
+            Some("One two\nthree four".to_string())
+        );
+        // Already the right number of lines: nothing to do.
+        assert_eq!(rewrap_lines("One\ntwo", 2), Some("One\ntwo".to_string()));
+        // Fewer characters than lines, or no whitespace to cut at.
+        assert_eq!(rewrap_lines("ab", 3), None);
+        assert_eq!(rewrap_lines("supercalifragilistic", 2), None);
+        assert_eq!(rewrap_lines("", 2), None);
+        // A single line never needs rebalancing.
+        assert_eq!(rewrap_lines("One line", 1), None);
+    }
+
+    #[test]
+    fn missing_numbers_ignores_formatting_but_catches_dropped_values() {
+        // Same numbers, different formatting: thousands separator dropped and
+        // decimal comma used instead of a point.
+        assert!(
+            missing_numbers(
+                "Hard deck is 5,000 feet.",
+                "Твърдата платформа е 5000 фута."
+            )
+            .is_empty()
+        );
+        assert!(missing_numbers("Stress limit is 7.5.", "Лимитът е 7,5.").is_empty());
+        // A number the reply never mentions is a content error.
+        assert_eq!(
+            missing_numbers(
+                "Not 10.1. Not 10.2. Mach 10.",
+                "Лимитът по договора е Мах 10."
+            ),
+            vec!["10.1".to_string(), "10.2".to_string()]
+        );
+        assert_eq!(
+            missing_numbers("He's at Mach 7, pushing 8.", "Той е на скорост 8 Маха."),
+            vec!["7".to_string()]
+        );
+        // Markup and placeholders are not numbers.
+        assert!(missing_numbers(r"{\an8}Top line 2", "<t0>Горен ред 2").is_empty());
+        // No numbers in the source: nothing to preserve.
+        assert!(missing_numbers("Hello there", "Здравей").is_empty());
+    }
+
+    #[test]
+    fn normalize_number_unifies_grouping_and_decimal_separators() {
+        assert_eq!(normalize_number("5,000").as_deref(), Some("5000"));
+        assert_eq!(normalize_number("1.234.567").as_deref(), Some("1234567"));
+        assert_eq!(normalize_number("7.5").as_deref(), Some("7.5"));
+        assert_eq!(normalize_number("7,5").as_deref(), Some("7.5"));
+        assert_eq!(normalize_number("2019").as_deref(), Some("2019"));
+        // Not a single number, so it is left out of the comparison entirely.
+        assert_eq!(normalize_number("1..2"), None);
+        assert_eq!(normalize_number(",5"), None);
     }
 
     #[test]
@@ -1434,7 +1717,7 @@ mod tests {
     }
 
     #[test]
-    fn assemble_normalizes_crlf_and_rejects_trailing_newlines() {
+    fn assemble_normalizes_crlf_and_rebalances_merged_lines() {
         let batch = vec![item(0, "Line one\nLine two")];
         let protected = vec![("Line one\nLine two".to_string(), vec![])];
         let reply = BTreeMap::from([(1, "Ред едно\r\nРед две".to_string())]);
@@ -1449,17 +1732,37 @@ mod tests {
         assert_eq!(out.get(&0).map(String::as_str), Some("Ред едно\nРед две"));
         assert!(lost.is_empty());
 
-        let reply = BTreeMap::from([(1, "Ред едно\nРед две\n".to_string())]);
+        // A terminator must not be mistaken for a second subtitle line: after
+        // trimming, "Ред едно" is one line where the source had two, so the
+        // cue is retried rather than accepted as text plus a blank line.
+        let reply = BTreeMap::from([(1, "Ред едно\n".to_string())]);
+        let mut report = Report::default();
         let (out, lost) = assemble_reply(
             reply,
             &batch,
             &protected,
             &bg(),
             AcceptPartial::Reject,
-            &mut Report::default(),
+            &mut report,
         );
         assert!(out.is_empty());
         assert_eq!(lost, vec![0]);
+
+        // Final fallback keeps the merge but rebalances the line breaks back
+        // to the source's two lines.
+        let reply = BTreeMap::from([(1, "Ред едно и ред две\n".to_string())]);
+        let mut report = Report::default();
+        let (out, _) = assemble_reply(
+            reply,
+            &batch,
+            &protected,
+            &bg(),
+            AcceptPartial::Accept,
+            &mut report,
+        );
+        assert_eq!(out.get(&0).map(String::as_str), Some("Ред едно\nи ред две"));
+        assert!(report.line_issues().is_empty());
+        assert_eq!(report.rewrapped_issues(), vec![0]);
     }
 
     #[test]
@@ -1792,7 +2095,7 @@ mod tests {
     }
 
     #[test]
-    fn assemble_reply_records_degradations_for_kept_cues() {
+    fn assemble_reply_rewraps_merged_lines_for_kept_cues() {
         // Two-line source answered with one line, in Accept mode.
         let batch = vec![item(3, "Line one\nLine two")];
         let protected = vec![("Line one\nLine two".to_string(), vec![])];
@@ -1807,17 +2110,12 @@ mod tests {
             AcceptPartial::Accept,
             &mut report,
         );
-        assert!(out.contains_key(&3), "cue is still translated");
-        assert_eq!(report.line_issues(), vec![3]);
+        // The merge is repaired rather than left as a single overflowing line.
+        assert_eq!(out.get(&3).map(String::as_str), Some("Един\nред"));
+        assert!(report.line_issues().is_empty());
         assert_eq!(
             report.degradations,
-            vec![(
-                3,
-                Degradation::Lines {
-                    source: 2,
-                    result: 1
-                }
-            )]
+            vec![(3, Degradation::Rewrapped { lines: 2 })]
         );
     }
 

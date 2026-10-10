@@ -8,6 +8,7 @@ mod translate;
 
 use config::Config;
 use lang::Lang;
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -188,14 +189,24 @@ fn run(args: Args) -> Result<(), String> {
 
     let (translated, report) = translate::translate_items(&cfg, &items, &target);
 
-    let mut failed = 0usize;
+    // A cue counts as translated only if it actually changed into the target
+    // language. Three things disqualify it: no usable reply at all, a reply
+    // that reads as the source language, and a byte-identical no-op (short
+    // cues like `Mach 10!` or `2019` the model correctly leaves alone — but
+    // they are not translations, so they must not inflate the headline count).
+    // Keys are 0-based file positions (`Item::index`), matching `Report`.
+    let mut untouched: BTreeSet<usize> = BTreeSet::new();
     for (item, text) in items.iter().zip(&translated) {
         match text {
             Some(text) => {
-                parsed.cues[item.index].text = text.split('\n').map(str::to_string).collect()
+                if text.as_str() == item.text.as_str() {
+                    untouched.insert(item.index);
+                } else {
+                    parsed.cues[item.index].text = text.split('\n').map(str::to_string).collect();
+                }
             }
             None => {
-                failed += 1;
+                untouched.insert(item.index);
                 eprintln!("warning: cue {} left in English", item.index + 1);
             }
         }
@@ -207,30 +218,36 @@ fn run(args: Args) -> Result<(), String> {
         .iter()
         .zip(translated.iter())
         .filter(|(item, t)| t.as_deref() == Some(item.text.as_str()))
-        .map(|(item, _)| item.index + 1)
+        .map(|(item, _)| item.index)
         .collect();
 
-    // The Report keys degradations by 0-based file position (the same space
-    // as `Item::index`), but cue numbers shown to the user are 1-based.
-    let line_issues = cue_numbers(report.line_issues());
-    let markup_issues = cue_numbers(report.markup_issues());
-    let english_issues = cue_numbers(report.untranslated_issues());
+    // `Item::index` is the 0-based file position; the user-facing cue number
+    // is `index + 1`. `Report` keys degradations by the same 0-based position.
+    let line_issues = report.line_issues();
+    let rewrapped_issues = report.rewrapped_issues();
+    let untranslated_issues = report.untranslated_issues();
+    let number_issues = cue_numbers(&report.number_issues());
+    let markup_issues = cue_numbers(&report.markup_issues());
+    let english_issues = cue_numbers(&untranslated_issues);
+
+    // Two kinds of cue are not really translations even though the fallback
+    // ladder accepted them: those the model left byte-identical (`unchanged`),
+    // and those it returned as source-language text (`untranslated_issues`).
+    // Both must be subtracted from the headline count; without the second
+    // subtraction a paraphrase in English would be counted as translated.
+    untouched.extend(unchanged.iter().chain(&untranslated_issues));
 
     write_output(&output_path, &srt::serialize(&parsed))?;
 
     // Quality summary: failures alone understate the picture, since a cue can
     // be "translated" yet still differ from what was asked for.
     eprintln!("--- quality ---");
-    let translated_count = items
-        .len()
-        .saturating_sub(failed)
-        .saturating_sub(english_issues.len());
-    eprintln!("  translated          : {translated_count}");
+    eprintln!("  translated          : {}", items.len() - untouched.len());
     if !unchanged.is_empty() {
         eprintln!(
             "  unchanged (no-op)   : {}  -> {}",
             unchanged.len(),
-            list_cues(&unchanged)
+            list_cues(&cue_numbers(&unchanged))
         );
     }
     if !english_issues.is_empty() {
@@ -244,7 +261,21 @@ fn run(args: Args) -> Result<(), String> {
         eprintln!(
             "  line structure drift: {}  -> {}",
             line_issues.len(),
-            list_cues(&line_issues)
+            list_cues(&cue_numbers(&line_issues))
+        );
+    }
+    if !rewrapped_issues.is_empty() {
+        eprintln!(
+            "  line breaks rebalanced: {}  -> {}",
+            rewrapped_issues.len(),
+            list_cues(&cue_numbers(&rewrapped_issues))
+        );
+    }
+    if !number_issues.is_empty() {
+        eprintln!(
+            "  numbers dropped      : {}  -> {}",
+            number_issues.len(),
+            list_cues(&number_issues)
         );
     }
     if !markup_issues.is_empty() {
@@ -254,14 +285,25 @@ fn run(args: Args) -> Result<(), String> {
             list_cues(&markup_issues)
         );
     }
-    if failed > 0 {
-        eprintln!("  left in English     : {failed}");
+    // Untouched cues with no more specific diagnosis: the ones left in
+    // English because no reply survived the fallback ladder at all. Cues with
+    // drifted line structure are *not* subtracted — those were translated,
+    // just imperfectly, and are never part of `untouched`.
+    let diagnosed: BTreeSet<usize> = unchanged
+        .iter()
+        .chain(&untranslated_issues)
+        .copied()
+        .collect();
+    let unexplained = untouched.difference(&diagnosed).count();
+    if unexplained > 0 {
+        eprintln!("  left in English     : {unexplained}");
     }
-    if unchanged.is_empty()
+    if untouched.is_empty()
         && english_issues.is_empty()
         && line_issues.is_empty()
+        && rewrapped_issues.is_empty()
+        && number_issues.is_empty()
         && markup_issues.is_empty()
-        && failed == 0
     {
         eprintln!("  no issues detected");
     }
@@ -270,8 +312,8 @@ fn run(args: Args) -> Result<(), String> {
         "wrote {} ({} cue(s){})",
         output_path.display(),
         parsed.cues.len(),
-        if failed > 0 {
-            format!(", {failed} untranslated")
+        if !untouched.is_empty() {
+            format!(", {} untranslated", untouched.len())
         } else {
             String::new()
         }
@@ -368,8 +410,8 @@ fn write_output(output: &Path, contents: &str) -> Result<(), String> {
 /// Convert 0-based file positions (as `Report` stores them) into the 1-based
 /// cue numbers the SRT displays. Forgetting this is an easy way to print a
 /// summary that is silently off by one — see the test below.
-fn cue_numbers(positions: Vec<usize>) -> Vec<usize> {
-    positions.into_iter().map(|i| i + 1).collect()
+fn cue_numbers(positions: &[usize]) -> Vec<usize> {
+    positions.iter().map(|i| i + 1).collect()
 }
 
 /// Render cue numbers (1-based) compactly: `14, 15, 20 +3`.
@@ -424,8 +466,8 @@ mod tests {
     fn report_positions_are_printed_as_one_based_cue_numbers() {
         // `Report` stores 0-based file positions; cue 1 is position 0.
         // (translate tests pin `Report` to 0-based; this pins the conversion.)
-        assert_eq!(cue_numbers(vec![0, 4, 119]), vec![1, 5, 120]);
-        assert_eq!(cue_numbers(vec![]), Vec::<usize>::new());
+        assert_eq!(cue_numbers(&[0, 4, 119]), vec![1, 5, 120]);
+        assert_eq!(cue_numbers(&[]), Vec::<usize>::new());
     }
 
     #[test]

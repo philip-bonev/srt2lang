@@ -179,10 +179,24 @@ say something the source did not — an English echo reuses only source words.
 Short cues like `- Cory?` or `2019` are exempt either way.
 
 **Fallback ladder.** A cue is rejected from a batch if it is missing, dropped
-a placeholder, changed line count, or came back untranslated — then
-retried individually. The individual retry is accepted even if imperfect,
-because a translation with a warning beats English text. Anything still
-untranslated is kept as-is and reported.
+a placeholder, changed line count, came back untranslated, or lost a number
+from the source — then retried individually. The individual retry is accepted
+even if imperfect, because a translation with a warning beats English text.
+Anything still untranslated is kept as-is and reported.
+
+**Structural repairs.** Two accepted-reply failures are repaired rather than
+merely reported. A source cue broken over two lines that comes back as one
+long line is re-split at whitespace to the source's line count (`rewrap_lines`),
+so the on-screen layout survives; the movie sample went from 70 merged cues to
+0 this way. A reply that drops a number present in the source — `Not 10.1. Not
+10.2. Mach 10.` answered without ever mentioning 10.1 or 10.2 — is treated as
+a content error and retried. Numbers are compared after normalising `5,000` to
+`5000` and `7,5` to `7.5`, so only real drops are flagged.
+
+**Reply normalisation.** Model text is normalised to LF and trailing newlines
+are stripped before validation. A terminator is not a subtitle line: counting
+one lets a merged reply pass the line count check and then serialise as text
+followed by an invisible blank line.
 
 **Malformed JSON repairs.** Five known small-model failure patterns are
 repaired before or during parsing: raw newlines in strings, naive brace
@@ -201,17 +215,25 @@ are different questions:
 
 ```
 --- quality ---
-  translated          : 119
+  translated          : 114
   unchanged (no-op)   : 1  -> 92
-  line structure drift: 2  -> 54, 106
+  kept in English     : 2  -> 391, 1284
+  line structure drift: 1  -> 54
+  line breaks rebalanced: 67 -> 13, 63, 106 +64
+  numbers dropped      : 2  -> 664, 1135
   markup repaired     : 15 -> 1, 2, 3, 4, 25, 26, 27, 28 +7
   left in English     : 1
-wrote out.srt (120 cue(s), 1 untranslated)
+wrote out.srt (1441 cue(s), 7 untranslated)
 ```
 
 Cue numbers are 1-based, matching the SRT. Failures alone understate the
 picture — most degraded cues are *accepted*, not rejected, so they only show
 up here.
+
+`translated` counts only cues that actually became a translation: cues with no
+surviving reply, cues the model echoed back, and byte-identical no-ops such as
+`Mach 10!` or `2019` are all excluded. Without that subtraction the headline
+count is inflated by cues that were never translated.
 
 ## Limitations
 
