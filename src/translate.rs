@@ -399,41 +399,11 @@ fn assemble_reply(
                 item.index + 1
             );
         }
-        if !malformed_tags.is_empty() {
-            let (restored, unplaced) = restore_markup(&text, source, tags);
-            report.push(
-                item.index,
-                Degradation::Markup {
-                    tags: if unplaced.is_empty() {
-                        malformed_tags.join(", ")
-                    } else {
-                        format!(
-                            "{} (unplaced: {})",
-                            malformed_tags.join(", "),
-                            unplaced.join(", ")
-                        )
-                    },
-                },
-            );
-            if unplaced.is_empty() {
-                eprintln!(
-                    "  cue {}: model damaged markup ({}), repaired where possible",
-                    item.index + 1,
-                    malformed_tags.join(", ")
-                );
-            } else {
-                eprintln!(
-                    "  cue {}: model damaged markup and position is unknown for {}, keeping translation",
-                    item.index + 1,
-                    unplaced.join(", ")
-                );
-            }
-            out.insert(item.index, restored);
-            continue;
-        }
         // A merge is a display-layout failure, not a wording one: the source
         // was broken over `source_lines` for a reason. Rebalance the breaks
         // when the text allows it, and only report true drift when it does not.
+        // This runs before the markup branch below so a reply that is both
+        // merged *and* markup-damaged still gets its line breaks repaired.
         let text = if merged && result_lines < source_lines {
             match rewrap_lines(&text, source_lines) {
                 Some(rewrapped) => {
@@ -486,6 +456,38 @@ fn assemble_reply(
         } else {
             text
         };
+        if !malformed_tags.is_empty() {
+            let (restored, unplaced) = restore_markup(&text, source, tags);
+            report.push(
+                item.index,
+                Degradation::Markup {
+                    tags: if unplaced.is_empty() {
+                        malformed_tags.join(", ")
+                    } else {
+                        format!(
+                            "{} (unplaced: {})",
+                            malformed_tags.join(", "),
+                            unplaced.join(", ")
+                        )
+                    },
+                },
+            );
+            if unplaced.is_empty() {
+                eprintln!(
+                    "  cue {}: model damaged markup ({}), repaired where possible",
+                    item.index + 1,
+                    malformed_tags.join(", ")
+                );
+            } else {
+                eprintln!(
+                    "  cue {}: model damaged markup and position is unknown for {}, keeping translation",
+                    item.index + 1,
+                    unplaced.join(", ")
+                );
+            }
+            out.insert(item.index, restored);
+            continue;
+        }
         if !dropped_numbers.is_empty() {
             report.push(
                 item.index,
@@ -1134,7 +1136,87 @@ fn restore_markup(text: &str, source: &str, tags: &[String]) -> (String, Vec<Str
     for tag in &trailing {
         result.push_str(tag);
     }
+    let (result, dangling) = strip_dangling_closers(&result, tags);
+    unplaced.extend(dangling);
     (result, unplaced)
+}
+
+/// Drop closing tags that lost their opening partner in the reply, but only
+/// when the source actually had that partner: a source that is itself
+/// unbalanced (`text</i>` with no `<i>`) is preserved as-is.
+///
+/// When the model keeps the placeholder of a closing tag but drops its
+/// opening partner's, restoration re-inserts the closer alone: source
+/// `The <i>Duchessa</i>` becomes `Дучезата</i>`. A close tag with nothing
+/// open is never meaningful — players ignore it or, worse, show it
+/// literally. An *opening* tag without a close is left alone: in SRT that
+/// idiomatically means "styled until end of cue".
+fn strip_dangling_closers(text: &str, source_tags: &[String]) -> (String, Vec<String>) {
+    let has_opener = |name: &str| {
+        source_tags.iter().any(|tag| {
+            let inner = tag
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .trim_start_matches('/');
+            let name_end = inner
+                .find(|c: char| c.is_ascii_whitespace() || c == '/')
+                .unwrap_or(inner.len());
+            !tag.starts_with("</") && inner[..name_end].eq_ignore_ascii_case(name)
+        })
+    };
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut dangling = Vec::new();
+    let mut open: BTreeMap<String, usize> = BTreeMap::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let close = match chars[i] {
+            '<' => chars[i..]
+                .iter()
+                .position(|&c| c == '>')
+                .filter(|&rel| is_supported_html_tag(&chars[i..=i + rel])),
+            _ => None,
+        };
+        if let Some(rel) = close {
+            let tag: String = chars[i..=i + rel].iter().collect();
+            i += rel + 1;
+            let inner = tag
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .trim_start_matches('/');
+            let name_end = inner
+                .find(|c: char| c.is_ascii_whitespace() || c == '/')
+                .unwrap_or(inner.len());
+            let name = inner[..name_end].to_ascii_lowercase();
+            let is_self_closing =
+                tag.trim_end_matches('>').trim_end().ends_with('/') || name == "br";
+            let is_closing = tag.starts_with("</");
+            if is_self_closing {
+                out.push_str(&tag);
+            } else if is_closing {
+                let depth = open.entry(name.clone()).or_insert(0);
+                if *depth == 0 {
+                    if has_opener(&name) {
+                        dangling.push(tag);
+                    } else {
+                        out.push_str(&tag);
+                    }
+                } else {
+                    *depth -= 1;
+                    out.push_str(&tag);
+                }
+            } else {
+                *open.entry(name).or_insert(0) += 1;
+                out.push_str(&tag);
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    (out, dangling)
 }
 
 /// Where a placeholder sits in the protected source, if that position is
@@ -1455,6 +1537,33 @@ mod tests {
     }
 
     #[test]
+    fn restore_strips_closers_whose_opener_was_lost() {
+        // The model kept the closing tag's placeholder but dropped the
+        // opening one's: restoration would leave `Дучезата</i>` — a closer
+        // with nothing open, which players render as junk or ignore.
+        let (protected, tags) = protect_markup("The <i>Duchessa</i>");
+        assert_eq!(protected, "The <t0>Duchessa<t1>");
+        let (restored, unplaced) = restore_markup("Дучезата<t1>", &protected, &tags);
+        assert_eq!(restored, "Дучезата");
+        assert_eq!(unplaced, vec!["<i>", "</i>"]);
+
+        // An opener without a closer stays: unclosed `<i>` means
+        // "italic until end of cue", which is idiomatic SRT. Here `</i>`
+        // sat mid-text so it cannot be re-inserted; the kept `<t0>` is.
+        let (protected, tags) = protect_markup("<i>Duchessa's</i> manifest");
+        let (restored, unplaced) = restore_markup("<t0>Манифестът", &protected, &tags);
+        assert_eq!(restored, "<i>Манифестът");
+        assert_eq!(unplaced, vec!["</i>"]);
+
+        // A source that is itself unbalanced keeps its shape: with no
+        // opener anywhere in the source tags, a closer is not "dangling",
+        // it is the source's own (odd) markup echoed back.
+        let (kept, dangling) = strip_dangling_closers("текст</i>", &["</i>".to_string()]);
+        assert_eq!(kept, "текст</i>");
+        assert!(dangling.is_empty());
+    }
+
+    #[test]
     fn restore_tolerates_lowercased_placeholders() {
         let tags = vec!["<i>".to_string()];
         let (restored, _) = restore_markup("кажи <T0> нещо", "<t0>say this", &tags);
@@ -1763,6 +1872,36 @@ mod tests {
         assert_eq!(out.get(&0).map(String::as_str), Some("Ред едно\nи ред две"));
         assert!(report.line_issues().is_empty());
         assert_eq!(report.rewrapped_issues(), vec![0]);
+    }
+
+    #[test]
+    fn assemble_rewraps_even_when_markup_is_also_damaged() {
+        // A reply that is *both* merged and missing its placeholders used to
+        // skip the rewrap: the markup branch `continue`d first, leaving one
+        // long line where the source had two (observed on the movie2 sample).
+        let batch = vec![item(0, "<i>Line one\nLine two</i>")];
+        let protected = vec![(
+            "<t0>Line one\nLine two<t1>".to_string(),
+            vec!["<i>".to_string(), "</i>".to_string()],
+        )];
+        let reply = BTreeMap::from([(1, "Ред едно и ред две".to_string())]);
+        let mut report = Report::default();
+        let (out, lost) = assemble_reply(
+            reply,
+            &batch,
+            &protected,
+            &bg(),
+            AcceptPartial::Accept,
+            &mut report,
+        );
+        assert_eq!(
+            out.get(&0).map(String::as_str),
+            Some("<i>Ред едно\nи ред две</i>")
+        );
+        assert!(lost.is_empty());
+        assert_eq!(report.rewrapped_issues(), vec![0]);
+        assert_eq!(report.markup_issues(), vec![0]);
+        assert!(report.line_issues().is_empty());
     }
 
     #[test]

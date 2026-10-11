@@ -168,7 +168,12 @@ preserves cross-cue context and cuts request count.
 request and restored afterwards, so preservation doesn't depend on the model
 obeying instructions. Hallucinated placeholder residue is stripped, and tags
 the model dropped are re-inserted at their original position when that
-position is unambiguous.
+position is unambiguous. A closing tag whose opening partner the model dropped
+is removed too — `Дучезата</i>` with nothing open is junk — while an opener
+without a closer stays (unclosed `<i>` means "styled until end of cue").
+Repairs on an accepted reply run in a fixed order: line re-wrapping first,
+markup restoration second, so a reply that is both merged *and* markup-damaged
+still gets its line breaks rebalanced.
 
 **Reply validation.** Structural checks alone are not enough — a reply can be
 perfectly well-formed and entirely untranslated, because small models sometimes

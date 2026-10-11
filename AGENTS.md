@@ -173,7 +173,12 @@ does not depend on model obedience:
    prompt that names concrete examples reliably makes a small model emit
    them), and **re-inserts dropped tags** at their original position when that
    position is unambiguous (leading → front, trailing → back; mid-text tags
-   cannot be placed and are reported).
+   cannot be placed and are reported). A closing tag whose opening partner the
+   model dropped is stripped too (`strip_dangling_closers`) — `Дучезата</i>`
+   with nothing open is junk — but only when the source itself had that
+   partner; an unbalanced source keeps its shape. An opener without a closer
+   is left alone: unclosed `<i>` idiomatically means "styled until end of
+   cue".
 
 ### Fallback ladder
 
@@ -200,6 +205,9 @@ leave a file that is structurally wrong even though the wording is fine.
   Measured on `sample.movie.srt`: this took the file from **70 merged cues to
   0**, with timestamps and cue count untouched. If the text cannot be split
   that many ways it is left merged and reported as `Degradation::Lines`.
+  The rewrap must run **before** the markup branch in `assemble_reply` — an
+  earlier version let the markup path `continue` first, and the first movie2
+  sample escaped with 35 merged cues that were never rebalanced.
 - **Dropped numbers.** `Not 10.1. Not 10.2. Mach 10.` answered with a
   sentence that never mentions 10.1 or 10.2 has lost its meaning, not just
   its style. `missing_numbers` compares normalised numeric tokens — `5,000`
