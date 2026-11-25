@@ -342,11 +342,17 @@ JSON config file, discovered in order:
 All fields are optional (`#[serde(default)]`); the file only overrides what it
 contains. Fields: `endpoint`, `api_key`, `model`, `temperature`, `max_tokens`,
 `timeout_secs`, `retries`, `batch_size`, `max_batch_chars`, `disable_thinking`,
-`lang`, `system_prompt`.
+`lang`, `system_prompt`, `unload_after`.
 
 CLI overrides exist for the common ones (`--lang`, `--model`, `--endpoint`,
 `--batch-size`); see `--help`. `system_prompt` may contain `{lang}`, which is
 substituted with the target language's English name.
+
+`unload_after` (`off` | `model` | `all`, default `off`) POSTs to the
+endpoint's `/v1/unload` after a successful run — `model` names the configured
+model, `all` sends `{}` to unload everything (Lemonade's API). `unload_url`
+derives the route from `endpoint`; a failed unload warns on stderr and never
+fails the run, since the output file is already written.
 
 ## Code layout
 

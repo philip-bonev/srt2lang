@@ -2,6 +2,23 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// What to do with the server's loaded models once the run is over.
+///
+/// The endpoint is derived from `endpoint` by replacing its trailing
+/// chat-completions path with `/v1/unload` (Lemonade's unload route).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UnloadAfter {
+    /// Leave the server alone (default).
+    #[default]
+    Off,
+    /// Unload only the model this run used — frees its VRAM while leaving
+    /// anything else the server holds untouched.
+    Model,
+    /// Unload every model the server has loaded (empty JSON body).
+    All,
+}
+
 /// Runtime configuration, loaded from a JSON file and overridable from the CLI.
 ///
 /// Every field has a sensible default, so a missing (or partial) config file
@@ -34,6 +51,8 @@ pub struct Config {
     pub system_prompt: Option<String>,
     /// Target language as an ISO 639-1 (or -3) code: `bg`, `fr`, `ru`, …
     pub lang: String,
+    /// Unload model(s) from the server after a finished run (`off`/`model`/`all`).
+    pub unload_after: UnloadAfter,
 }
 
 impl Default for Config {
@@ -51,6 +70,7 @@ impl Default for Config {
             disable_thinking: true,
             system_prompt: None,
             lang: "bg".to_string(),
+            unload_after: UnloadAfter::Off,
         }
     }
 }
@@ -130,5 +150,21 @@ mod tests {
         let cfg = Config::load(Some(&path.display().to_string())).unwrap();
         assert_eq!(cfg.batch_size, 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unload_after_defaults_to_off() {
+        assert_eq!(Config::default().unload_after, UnloadAfter::Off);
+        let cfg: Config = serde_json::from_str(r#"{"model":"x"}"#).unwrap();
+        assert_eq!(cfg.unload_after, UnloadAfter::Off);
+    }
+
+    #[test]
+    fn unload_after_parses_variants() {
+        let cfg: Config = serde_json::from_str(r#"{"unload_after":"model"}"#).unwrap();
+        assert_eq!(cfg.unload_after, UnloadAfter::Model);
+        let cfg: Config = serde_json::from_str(r#"{"unload_after":"all"}"#).unwrap();
+        assert_eq!(cfg.unload_after, UnloadAfter::All);
+        assert!(serde_json::from_str::<Config>(r#"{"unload_after":"bogus"}"#).is_err());
     }
 }

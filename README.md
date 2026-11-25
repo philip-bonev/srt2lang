@@ -163,7 +163,8 @@ All fields are optional; the file only overrides what it contains.
   "batch_size": 4,
   "max_batch_chars": 400,
   "disable_thinking": true,
-  "lang": "bg"
+  "lang": "bg",
+  "unload_after": "off"
 }
 ```
 
@@ -172,6 +173,11 @@ Notes:
 - `lang` — target language, ISO 639-1 (`fr`, `bg`, `ru`, …); `-l` overrides it.
 - `endpoint` — any OpenAI-compatible `/v1/chat/completions`.
 - `api_key` — optional; sent as a Bearer token when non-empty.
+- `unload_after` — free the server's model memory when the run is over:
+  `"off"` (default) does nothing, `"model"` unloads the configured model,
+  `"all"` unloads every model the server has loaded. The request goes to the
+  endpoint's `/v1/unload` (Lemonade); a failed unload only warns — the
+  translated file has already been written.
 - `model` — **not validated** by llama-server, so it documents intent. The
   model actually served is whichever one Lemonade has loaded
   (`lemonade status`), and only one LLM fits at a time. Switching models means

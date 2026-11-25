@@ -318,6 +318,25 @@ fn run(args: Args) -> Result<(), String> {
             String::new()
         }
     );
+
+    // The translation is done and on disk — free the model if asked to.
+    // Best-effort: a failed unload must not turn a successful run into an
+    // error, so it only warns.
+    if cfg.unload_after != config::UnloadAfter::Off {
+        let url = translate::unload_url(&cfg.endpoint);
+        eprintln!(
+            "unloading {} from {url} ...",
+            if cfg.unload_after == config::UnloadAfter::All {
+                "all models".to_string()
+            } else {
+                format!("model '{}'", cfg.model)
+            },
+        );
+        match translate::unload_models(&cfg) {
+            Ok(()) => eprintln!("model unloaded"),
+            Err(e) => eprintln!("warning: unload failed: {e}"),
+        }
+    }
     Ok(())
 }
 

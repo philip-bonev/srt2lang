@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
-use crate::config::Config;
+use crate::config::{Config, UnloadAfter};
 use crate::lang::Lang;
 
 /// Instructs the model to return a bare JSON object keyed like the input.
@@ -590,6 +590,66 @@ fn post_chat(cfg: &Config, payload: &Value) -> Result<String, String> {
         .filter(|c| !c.trim().is_empty())
         .ok_or_else(|| "empty content in model reply (is thinking disabled?)".to_string())?;
     Ok(content)
+}
+
+/// Unload route behind an OpenAI-style endpoint:
+/// `http://h:13305/v1/chat/completions` -> `http://h:13305/v1/unload`.
+///
+/// A prefix before `/v1/chat/completions` is kept (`/openai/v1/chat/...` ->
+/// `/openai/v1/unload`); an endpoint that does not look like a chat URL at
+/// all falls back to the origin, so the path is never doubled.
+pub fn unload_url(endpoint: &str) -> String {
+    if let Some(base) = endpoint.strip_suffix("/v1/chat/completions") {
+        return format!("{base}/v1/unload");
+    }
+    if let Some(base) = endpoint.strip_suffix("/chat/completions") {
+        return format!("{base}/v1/unload");
+    }
+    let origin = match endpoint.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.split('/').next().unwrap_or(rest);
+            format!("{scheme}://{host}")
+        }
+        None => endpoint.to_string(),
+    };
+    format!("{origin}/v1/unload")
+}
+
+/// POST to the server's `/v1/unload` to free model memory once the run is
+/// over (config `unload_after`). `Model` names the configured model, `All`
+/// sends an empty object — the API unloads everything when `model_name` is
+/// absent. Best-effort: callers report failures as warnings, because the
+/// translation itself has already succeeded at this point.
+pub fn unload_models(cfg: &Config) -> Result<(), String> {
+    let url = unload_url(&cfg.endpoint);
+    let mut request = ureq::post(&url)
+        .header("Content-Type", "application/json")
+        .config()
+        .timeout_global(Some(Duration::from_secs(cfg.timeout_secs)))
+        .build();
+    if !cfg.api_key.is_empty() {
+        request = request.header("Authorization", format!("Bearer {}", cfg.api_key));
+    }
+
+    let body = match cfg.unload_after {
+        UnloadAfter::Model => json!({ "model_name": cfg.model }),
+        _ => json!({}),
+    };
+
+    let mut response = request
+        .send_json(body)
+        .map_err(|e| format!("request error: {e}"))?;
+    let status = response.status();
+    let text = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_RESPONSE_BYTES)
+        .read_to_string()
+        .map_err(|e| format!("cannot read response body: {e}"))?;
+    if !(200..300).contains(&status.as_u16()) {
+        return Err(format!("HTTP {status}: {}", truncate(text.trim(), 300)));
+    }
+    Ok(())
 }
 
 /// Extract translations from raw model output, tolerating markdown fences
@@ -1349,6 +1409,139 @@ mod tests {
     /// tests were written against before the target became configurable.
     fn bg() -> Lang {
         Lang::resolve("bg").expect("built-in default always resolves")
+    }
+
+    #[test]
+    fn unload_url_is_derived_from_the_chat_endpoint() {
+        assert_eq!(
+            unload_url("http://192.168.1.2:13305/v1/chat/completions"),
+            "http://192.168.1.2:13305/v1/unload"
+        );
+        // non-standard mount: the prefix survives, only the route changes
+        assert_eq!(
+            unload_url("http://host:8001/openai/v1/chat/completions"),
+            "http://host:8001/openai/v1/unload"
+        );
+        assert_eq!(
+            unload_url("http://host:8001/chat/completions"),
+            "http://host:8001/v1/unload"
+        );
+    }
+
+    /// The unload POST must hit `/v1/unload` (not the chat route), carry the
+    /// configured model name, and reuse the bearer token.
+    #[test]
+    fn unload_models_posts_model_name_to_unload_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).unwrap();
+                header.extend_from_slice(&byte);
+                if header.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = String::from_utf8(header).unwrap();
+            assert!(
+                header.starts_with("POST /v1/unload HTTP/1.1\r\n"),
+                "request line: {}",
+                header.lines().next().unwrap_or("")
+            );
+            let header_lower = header.to_ascii_lowercase();
+            assert!(header_lower.contains("authorization: bearer test-token\r\n"));
+            let content_length = header_lower
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let mut request_body = vec![0; content_length];
+            stream.read_exact(&mut request_body).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&String::from_utf8(request_body).unwrap()).unwrap(),
+                json!({"model_name": "test-model"})
+            );
+
+            let body = json!({"status": "success"}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let cfg = Config {
+            endpoint,
+            api_key: "test-token".to_string(),
+            model: "test-model".to_string(),
+            unload_after: crate::config::UnloadAfter::Model,
+            ..Config::default()
+        };
+        unload_models(&cfg).unwrap();
+        server.join().unwrap();
+    }
+
+    /// `unload_after = "all"` omits `model_name`, which the API reads as
+    /// "unload every loaded model".
+    #[test]
+    fn unload_all_sends_empty_object() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).unwrap();
+                header.extend_from_slice(&byte);
+                if header.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = String::from_utf8(header).unwrap();
+            let header_lower = header.to_ascii_lowercase();
+            let content_length = header_lower
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let mut request_body = vec![0; content_length];
+            stream.read_exact(&mut request_body).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&String::from_utf8(request_body).unwrap()).unwrap(),
+                json!({})
+            );
+
+            let body = json!({"status": "success"}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let cfg = Config {
+            endpoint,
+            unload_after: crate::config::UnloadAfter::All,
+            ..Config::default()
+        };
+        unload_models(&cfg).unwrap();
+        server.join().unwrap();
     }
 
     #[test]
