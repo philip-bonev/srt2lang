@@ -97,6 +97,32 @@ cargo clippy --all-targets
 Use the **release** binary for real runs; the debug build is several times
 slower and will skew any timing.
 
+### Debian package
+
+`cargo deb` (the `cargo-deb` plugin) builds a `.deb` from the
+`[package.metadata.deb]` section in `Cargo.toml`:
+
+```sh
+cargo install cargo-deb     # once
+cargo deb                   # -> target/debian/srt2lang_<ver>_<arch>.deb
+```
+
+**Build the real packages on Linux**, not on macOS: `cargo deb` on a Mac
+packages the Mach-O binary, which will not run on Debian (cargo-deb warns
+"creating a package only for macos"). On a Linux machine both architectures
+come from the same command with `--target`:
+
+```sh
+rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+cargo deb --target x86_64-unknown-linux-gnu   # -> ..._amd64.deb
+cargo deb --target aarch64-unknown-linux-gnu  # -> ..._arm64.deb
+```
+
+Cross-building from x86_64 to arm64 needs a cross linker
+(`gcc-aarch64-linux-gnu`, or `cargo-zigbuild`); native builds need nothing
+extra. `depends = "$auto"` resolves shared-library deps via `dpkg-shlibdeps`,
+which only exists on Linux — on macOS the `Depends` field comes out empty.
+
 ## Usage
 
 ```sh

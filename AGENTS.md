@@ -25,11 +25,20 @@ cargo build -r              # release build -> target/release/srt2lang (optimize
 cargo test                  # unit tests (srt parsing, config, batching, response parsing)
 cargo run -- movie.srt      # translate, writes movie.bg.srt (default lang bg)
 cargo run -- movie.srt -l fr    # ... writes movie.fr.srt
+cargo deb                   # .deb package -> target/debian/ (needs `cargo install cargo-deb`)
 ```
 
 `-r` is cargo's shorthand for `--release`. Live runs and timing comparisons
 should use `target/release/srt2lang`; the debug binary is several times slower
 and would skew any measurement.
+
+`cargo deb` reads `[package.metadata.deb]` from `Cargo.toml` (maintainer,
+`license-file = ["LICENSE", "0"]`, `section = "utils"`, `$auto` assets/deps).
+**On macOS it packages the Mach-O binary** — fine as a packaging smoke test,
+but the shipped `.deb` must be built on Linux (or cross-compiled with
+`--target x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu`, which needs
+a cross linker). `$auto` depends resolve through `dpkg-shlibdeps`, which only
+exists on Linux, so `Depends` is empty when building on a Mac.
 
 Edition: 2024 (rustc 1.99+).
 

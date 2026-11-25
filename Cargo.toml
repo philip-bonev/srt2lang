@@ -1,12 +1,27 @@
 [package]
 name = "srt2lang"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2024"
 rust-version = "1.99"
 description = "Console tool that translates English SRT subtitles into another language via an OpenAI-compatible LLM endpoint"
+license = "Apache-2.0"
+homepage = "https://github.com/philip-bonev/srt2lang"
+repository = "https://github.com/philip-bonev/srt2lang"
 
 [dependencies]
 iso639 = "0.2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
+
+[profile.release]
+strip = true
+
+[package.metadata.deb]
+maintainer = "Philip Bonev"
+copyright = "2026, Philip Bonev"
+license-file = ["LICENSE", "0"]
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = ["$auto"]
